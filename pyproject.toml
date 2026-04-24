@@ -15,6 +15,13 @@ dependencies = [
     "zarr>=3.0",
 ]
 
+[project.optional-dependencies]
+reactive-viz = [
+    "ipympl>=0.10.0",
+    "ipywidgets>=8.1.8",
+    "jupyter>=1.1.1",
+]
+
 [dependency-groups]
 dev = [
     "pre-commit>=4.6.0",
@@ -54,6 +61,8 @@ ignore = [
     "D213",  # conflicts with D212 (multi-line docstring summary on first line)
     "E741",  # ambiguous variable names (allow i, j, k, l for grid indices)
     "F722",  # jaxtyping shape strings trip the forward-reference checker
+    "F821",  # single-symbol jaxtyping dims (e.g. "N") look like undefined names
+    "UP037", # keep jaxtyping shape strings quoted; unquoting breaks them
 ]
 
 [tool.ruff.lint.pydocstyle]
