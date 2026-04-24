@@ -21,6 +21,7 @@ repos:
     rev: v1.1.409
     hooks:
       - id: pyright
+        files: ^mamba_dvc/.*\.py$
         additional_dependencies:
           - numpy>=2.0
           - scipy>=1.13
