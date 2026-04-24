@@ -1,0 +1,94 @@
+[project]
+name = "mamba-dvc"
+version = "0.1.0"
+description = "FFT digital volume correlation for synchrotron µCT of rat bone with screw implant."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "beartype>=0.22.9",
+    "cupy-cuda13x>=14.0",
+    "jaxtyping>=0.3.9",
+    "numpy>=2.0",
+    "scipy>=1.13",
+    "tensorstore>=0.1.82",
+    "tifffile>=2026.4.11",
+    "zarr>=3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.0",
+    "pyright>=1.1.409",
+    "pytest>=9.0.3",
+    "ruff>=0.15.11",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mamba_dvc"]
+
+[tool.ruff]
+line-length = 95
+target-version = "py314"
+src = ["mamba_dvc"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "N",    # pep8-naming
+    "D",    # pydocstyle
+    "NPY",  # numpy-specific
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "D203",  # conflicts with D211 (no blank line before class docstring)
+    "D213",  # conflicts with D212 (multi-line docstring summary on first line)
+    "E741",  # ambiguous variable names (allow i, j, k, l for grid indices)
+    "F722",  # jaxtyping shape strings trip the forward-reference checker
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]           # tests don't need docstrings
+"validate/**" = ["D"]        # validation scripts are internal
+"**/__init__.py" = ["D104"]  # no docstring required in package __init__
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.pyright]
+include = ["mamba_dvc"]
+exclude = ["**/__pycache__", "**/.venv", "build", "dist"]
+pythonVersion = "3.14"
+pythonPlatform = "Windows"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = "warning"
+reportUnknownMemberType = "warning"
+reportUnknownVariableType = "warning"
+reportUnknownArgumentType = "warning"
+# jaxtyping shape strings are valid at runtime but appear as forward refs to pyright
+reportGeneralTypeIssues = "warning"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "gpu: tests that require a CUDA-capable GPU",
+    "slow: tests that take more than a few seconds",
+]
