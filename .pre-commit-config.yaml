@@ -21,3 +21,8 @@ repos:
     rev: v1.1.409
     hooks:
       - id: pyright
+        additional_dependencies:
+          - numpy>=2.0
+          - scipy>=1.13
+          - jaxtyping>=0.3.9
+          - beartype>=0.22.9
