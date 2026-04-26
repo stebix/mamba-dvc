@@ -29,7 +29,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-from jaxtyping import Float32, Int64
+from jaxtyping import Bool, Float32, Int64
 
 try:
     import cupy as _cp  # pyright: ignore[reportMissingImports]
@@ -88,10 +88,10 @@ def _rolling_window_view(
 
 
 def extract_subvolumes(
-    volume: Float32[np.ndarray, "z y x"],
+    volume: Float32[np.ndarray, "z y x"] | Bool[np.ndarray, "z y x"],
     starts: Int64[np.ndarray, "batch 3"],
     window: tuple[int, int, int],
-) -> Float32[np.ndarray, "batch w w w"]:
+) -> Float32[np.ndarray, "batch w w w"] | Bool[np.ndarray, "batch w w w"]:
     """Gather subvolumes at the given integer start indices.
 
     Parameters
@@ -99,11 +99,14 @@ def extract_subvolumes(
     volume
         ``(z, y, x)`` source volume. May be a NumPy array (host) or a
         CuPy array (device); the output uses the same array module.
-        Dtype must be ``float32``.
+        Dtype must be ``float32`` or ``bool`` -- the ``bool`` path
+        exists so the orchestrator can pull mask subvolumes through the
+        same gather without first materializing a float32 copy of the
+        full mask.
     starts
         ``(batch, 3)`` array of integer ``(z0, y0, x0)`` start indices,
         one per requested subvolume. Must be ``int64`` and live in the
-        same array module as ``volume`` — no implicit host/device
+        same array module as ``volume`` -- no implicit host/device
         transfer happens here.
     window
         ``(wz, wy, wx)`` subvolume size in voxels. All entries must be
@@ -113,15 +116,16 @@ def extract_subvolumes(
     Returns
     -------
     numpy.ndarray or cupy.ndarray
-        ``(batch, wz, wy, wx)`` float32 C-contiguous array of gathered
-        subvolumes. Array module matches ``volume``.
+        ``(batch, wz, wy, wx)`` C-contiguous array of gathered
+        subvolumes. Dtype matches the input (``float32`` or ``bool``);
+        array module matches ``volume``.
 
     Raises
     ------
     ValueError
-        If ``volume`` is not 3D float32, if ``starts`` has wrong shape
-        or dtype, if ``window`` is malformed, or if any requested
-        subvolume would escape the volume bounds.
+        If ``volume`` is not 3D ``float32``/``bool``, if ``starts`` has
+        wrong shape or dtype, if ``window`` is malformed, or if any
+        requested subvolume would escape the volume bounds.
 
     Notes
     -----
@@ -136,8 +140,8 @@ def extract_subvolumes(
     """
     if volume.ndim != 3:
         raise ValueError(f"volume must be 3D, got ndim={volume.ndim}")
-    if volume.dtype != np.float32:
-        raise ValueError(f"volume must be float32, got {volume.dtype}")
+    if volume.dtype != np.float32 and volume.dtype != np.bool_:
+        raise ValueError(f"volume must be float32 or bool, got {volume.dtype}")
 
     if starts.ndim != 2 or starts.shape[1] != 3:
         raise ValueError(f"starts must have shape (batch, 3), got {starts.shape}")
@@ -160,9 +164,9 @@ def extract_subvolumes(
         )
 
     if starts.shape[0] == 0:
-        return xp.empty((0, wz, wy, wx), dtype=xp.float32)
+        return xp.empty((0, wz, wy, wx), dtype=volume.dtype)
 
-    # Eager bounds check — as_strided does no checking of its own.
+    # Eager bounds check -- as_strided does no checking of its own.
     # 0-d reductions support __int__ in both NumPy and CuPy, so the pulls
     # stay clean without branching on the array module.
     min_z = int(starts[:, 0].min())
@@ -181,4 +185,4 @@ def extract_subvolumes(
 
     view = _rolling_window_view(volume, win)
     gathered = view[starts[:, 0], starts[:, 1], starts[:, 2]]
-    return xp.ascontiguousarray(gathered, dtype=xp.float32)
+    return xp.ascontiguousarray(gathered)
