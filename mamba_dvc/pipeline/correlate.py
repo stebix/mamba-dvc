@@ -21,6 +21,7 @@ from mamba_dvc.core.extract import extract_subvolumes
 from mamba_dvc.core.grid import build_grid, filter_by_mask
 from mamba_dvc.core.ncc import correlate as correlate_ncc
 from mamba_dvc.core.ncc import peak_displacement
+from mamba_dvc.core.outlier import detect_outliers
 from mamba_dvc.core.peakfit import gaussian_subvoxel_fit
 from mamba_dvc.core.window import preprocess_subvolumes
 from mamba_dvc.types import DisplacementField, POIStatus
@@ -208,6 +209,16 @@ def correlate(
     status[out_of_range] = POIStatus.OUT_OF_RANGE
     displacements[out_of_range] = 0.0
     confidence[out_of_range] = 0.0
+
+    # Outlier rejection (plan §2 step 7). Run after the search-radius
+    # gate so out-of-range POIs do not participate in any neighborhood;
+    # the precedence MASKED -> OUT_OF_RANGE -> OUTLIER preserves the
+    # original failure mode for diagnostic stratification.
+    valid_pre = status == POIStatus.OK
+    outlier_flag = detect_outliers(grid, displacements, valid_pre)
+    status[outlier_flag] = POIStatus.OUTLIER
+    displacements[outlier_flag] = 0.0
+    confidence[outlier_flag] = 0.0
 
     valid = status == POIStatus.OK
 
