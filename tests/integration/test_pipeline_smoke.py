@@ -109,3 +109,70 @@ class TestPipelineSmoke:
 
         assert (field.status == POIStatus.OK).all()
         np.testing.assert_allclose(field.displacements, 0.0, atol=0.05)
+
+    def test_locally_corrupted_poi_is_flagged_outlier(self):
+        # Build a smooth-shift pair, then scramble one POI's deformed
+        # subvolume so its NCC peak lands at a wrong lag inconsistent
+        # with the lattice trend. The orchestrator's outlier wiring
+        # must promote that POI to status==OUTLIER while neighbors
+        # remain OK.
+        shape: tuple[int, int, int] = (160, 160, 160)
+        window = 64
+        overlap = 0.5
+        shift = (0.3, -0.4, 0.7)
+        pair = make_pair(shape=shape, field=rigid_shift(shift), seed=29)
+
+        # Find an interior POI's start position via build_grid; scramble
+        # a window-sized region of the deformed volume there with random
+        # noise, breaking spatial correlation. The picked POI is well
+        # away from the volume face.
+        grid = build_grid(shape, window=window, overlap=overlap)
+        target_idx = int(
+            np.ravel_multi_index(
+                (grid.grid_shape[0] // 2, grid.grid_shape[1] // 2, grid.grid_shape[2] // 2),
+                grid.grid_shape,
+            )
+        )
+        z0, y0, x0 = (int(v) for v in grid.starts[target_idx])
+        wz, wy, wx = grid.window
+        deformed_corrupt = pair.deformed.copy()
+        rng = np.random.default_rng(101)
+        deformed_corrupt[z0 : z0 + wz, y0 : y0 + wy, x0 : x0 + wx] = rng.standard_normal(
+            (wz, wy, wx), dtype=np.float32
+        )
+
+        field = correlate(
+            pair.reference,
+            deformed_corrupt,
+            window=window,
+            overlap=overlap,
+            search_radius=window // 2,
+        )
+
+        assert field.status[target_idx] == POIStatus.OUTLIER, (
+            f"expected target POI status=OUTLIER, got {field.status[target_idx]}; "
+            f"displacement={field.displacements[target_idx]}"
+        )
+
+        # Lattice neighbors of the target should remain OK -- the
+        # corruption is local. We check the 6-connected face neighbors
+        # in lattice coords.
+        nz, ny, nx = grid.grid_shape
+        target_zyx = np.unravel_index(target_idx, grid.grid_shape)
+        neighbor_offsets = [
+            (-1, 0, 0),
+            (1, 0, 0),
+            (0, -1, 0),
+            (0, 1, 0),
+            (0, 0, -1),
+            (0, 0, 1),
+        ]
+        for dz, dy, dx in neighbor_offsets:
+            nbz, nby, nbx = target_zyx[0] + dz, target_zyx[1] + dy, target_zyx[2] + dx
+            if not (0 <= nbz < nz and 0 <= nby < ny and 0 <= nbx < nx):
+                continue
+            i = int(np.ravel_multi_index((nbz, nby, nbx), grid.grid_shape))
+            assert field.status[i] == POIStatus.OK, (
+                f"neighbor at lattice {(nbz, nby, nbx)} unexpectedly flagged "
+                f"{POIStatus(field.status[i]).name}"
+            )
