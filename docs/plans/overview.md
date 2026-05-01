@@ -59,8 +59,8 @@ The v1 algorithm is a stripped-down descendant of **FIDVC** (Bar-Kochba et al. 2
    - Mean-subtract over unmasked voxels only (avoid bias from zeros inside the screw region).
    - Apply 3D Tukey window (α ≈ 0.25) to suppress spectral leakage.
    - Zero out masked voxels after windowing.
-4. **Batched FFT NCC** (`core/ncc.py`) — batched 3D `rfftn` of both stacks, conjugate multiply, `irfftn`. Normalize by the per-subvolume L2 norms computed over the valid-voxel support.
-5. **Peak localization** — `argmax` on each correlation volume (circular; lag interpreted modulo `W` then wrapped to `[-W/2, W/2)`).
+4. **Batched FFT NCC** (`core/ncc.py`) — two kernels live side-by-side; the pipeline driver picks one. Default is **linear NCC**: zero-pad each subvolume to `2W` along every spatial axis, batched 3D `rfftn` of both stacks, conjugate multiply, `irfftn` at padded size, then crop the central `W` block of valid lags and repack into cyclic-FFT layout. Normalize per lag with the **Lewis (1995) overlap-aware denominator** `sqrt(S_ref(k) · S_def(k))` where `S(k)` is the sum of squared signal over the in-bounds intersection at lag `k` (computed via two extra FFT-based correlations of `ref²` and `def²` against an indicator box, sharing one box FFT per batch). The legacy **cyclic NCC** (no zero-pad, single whole-window L2 normalization, plus a Tukey α=0.25 window in preprocessing to suppress wrap-induced leakage) is retained for A/B comparison; the rule of thumb `|d| ≤ W/3` survives in both kernels but for SNR reasons in linear mode (no aliasing argument) and for combined SNR + bias reasons in cyclic mode. The cyclic kernel exhibits a shrinkage bias toward zero whose magnitude scales with `|u|/W`; the linear+overlap kernel does not. See `docs/insights/error-minimization.md` for the diagnostic chain that pinned the bias and the plan revisions it drove.
+5. **Peak localization** — `argmax` on each correlation volume; lag is in cyclic-FFT layout (lag 0 at index 0; positive lags in `[0, W/2)`; negative lags in `[W/2, W)`) for both kernels, so this step is mode-agnostic.
 6. **Gaussian subvoxel fit** (`core/peakfit.py`) — closed-form log-space parabolic fit on the 3×3×3 neighborhood of the integer peak, along each axis independently (separable 3D Gaussian). Returns fractional `(dz, dy, dx)` plus a `confidence` score (peak NCC value).
 7. **Outlier rejection** (`core/outlier.py`) — normalized median test (Westerweel & Scarano) on a 3×3×3 neighborhood in the POI grid; skip masked-out neighbors so the boundary isn't flagged. Failed POIs set `valid=False` but stay in output.
 8. **Emit `DisplacementField`** (`types.py`) — positions, displacements, valid flags, confidence, grid metadata.
@@ -176,6 +176,10 @@ All public functions in `core/` and `pipeline/` use `jaxtyping` annotations on a
 
 ### Per-GPU budget (A6000, 49 GB)
 
+The cyclic kernel is the cheap reference; the linear kernel pays ~8× spectral footprint per POI because every FFT runs at `2W` per axis.
+
+**Cyclic NCC (legacy / A-side comparison)** at `W=96`, batch 256:
+
 | Item | Size |
 |---|---|
 | Reference volume (float32) | 6.29 GB |
@@ -187,7 +191,9 @@ All public functions in `core/` and `pipeline/` use `jaxtyping` annotations on a
 | cuFFT plan cache / misc | ~1 GB |
 | **Total in flight** | **~17 GB** |
 
-Comfortable fit. Batch 512 also viable (~20 GB). Room for 128³ windows if needed.
+Comfortable fit. Batch 512 also viable (~20 GB).
+
+**Linear NCC + overlap-aware (default)** at `W=96`: each `(2W)³` float32 buffer is 28 MB per POI, and the kernel materializes ref/def + their squared copies + four padded spectra during the overlap-aware path. At batch 256 the transient working set runs **>50 GB**, over budget on a single A6000. Drop `batch_size` to ~64 to fit (~14 GB transient, plus the resident volumes/mask). A future heuristic in `gpu/dispatch.py` will recommend a batch size from the resolved `(window, mode, normalization, free VRAM)` tuple programmatically; today the call site is responsible.
 
 ### Decomposition
 
@@ -251,6 +257,8 @@ Fields to cover:
 
 Each runs in seconds on one GPU; all are CI-eligible.
 
+**Bias regression test.** `tests/core/test_ncc.py::TestLinearVsCyclicBias` asserts that the linear+overlap kernel recovers integer shifts exactly on textured volumes where the deformed window is a *non-rolled* slab from a larger field — the construction `docs/insights/error-minimization.md` pinned the cyclic shrinkage with. This is the cheapest possible test that would have caught the bias on day one; it must pass for any PR that touches `core/ncc.py`.
+
 ### Tier 2 — experimental ground truth (`validate/known_fields.py`)
 
 Load a real `(reference, deformed, mask, gt_field)` tuple from your dataset, run `correlate()`, compute:
@@ -272,6 +280,7 @@ Not in CI (too big), run manually. Drives the accept/reject decision on the impl
 | Dense field | `DisplacementField.grid_shape + spacing` makes reshape-to-lattice trivial; add `densify(field, target_shape) → ndarray` module. |
 | Time series | Wrap `correlate()` in `series.py` with prefetch (load `t+1` while computing `t`) and optional warm-start (use previous field to set outlier priors). |
 | Per-frame deformed masks | `deformed_mask` parameter already in API; activate the branch in `window.py` and `ncc.py`. |
+| Centred correlation layout | `correlate_linear` currently re-packs to cyclic-FFT layout for drop-in compatibility with the cyclic kernel's downstream consumers. A v2 cleanup may switch to a centred layout (lag 0 at the volume centre) and update `peak_displacement` / `peakfit._gather_neighbors` to honour a `centered` flag — the natural layout for a linear correlator that has no wrap-around to encode. |
 
 ## 11. Code quality standards (locations)
 
