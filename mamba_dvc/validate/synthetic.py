@@ -394,6 +394,7 @@ def make_pair(
     seed: int = 0,
     mask: Bool[np.ndarray, "z y x"] | None = None,
     order: int = 3,
+    reference: Float32[np.ndarray, "z y x"] | None = None,
 ) -> SyntheticPair:
     """Produce a ``(reference, deformed, field, mask)`` bundle.
 
@@ -404,14 +405,20 @@ def make_pair(
     field
         Analytical displacement to apply.
     texture_sigma
-        Gaussian sigma for :func:`make_texture`.
+        Gaussian sigma for :func:`make_texture`. Ignored when
+        ``reference`` is supplied.
     seed
-        RNG seed for :func:`make_texture`.
+        RNG seed for :func:`make_texture`. Ignored when ``reference``
+        is supplied.
     mask
         Optional boolean mask, passed through to the result; this
         module does not generate masks itself.
     order
         Spline order for the warp.
+    reference
+        Optional pre-built reference volume (e.g. a phantom from
+        :mod:`mamba_dvc.validate.phantoms`). When ``None`` (default),
+        ``make_texture`` generates a band-limited noise reference.
 
     Returns
     -------
@@ -423,15 +430,26 @@ def make_pair(
     ------
     ValueError
         If ``mask`` is provided but its shape does not match
-        ``shape``.
+        ``shape``, or if ``reference`` is provided with the wrong
+        shape / dtype.
     """
     if mask is not None and mask.shape != shape:
         raise ValueError(f"mask shape {mask.shape} does not match requested shape {shape}")
 
-    reference = make_texture(shape, sigma=texture_sigma, seed=seed)
-    deformed = warp(reference, field, order=order)
+    if reference is None:
+        reference_arr = make_texture(shape, sigma=texture_sigma, seed=seed)
+    else:
+        if reference.shape != shape:
+            raise ValueError(
+                f"reference shape {reference.shape} does not match requested shape {shape}"
+            )
+        if reference.dtype != np.float32:
+            raise ValueError(f"reference must be float32, got {reference.dtype}")
+        reference_arr = reference
+
+    deformed = warp(reference_arr, field, order=order)
     return SyntheticPair(
-        reference=reference,
+        reference=reference_arr,
         deformed=deformed,
         field=field,
         mask=mask,
