@@ -214,10 +214,12 @@ class TestPeakfitOnSyntheticPair:
         ref_sv = pair.reference[cz : cz + w, cy : cy + w, cx : cx + w][None, ...]
         def_sv = pair.deformed[cz : cz + w, cy : cy + w, cx : cx + w][None, ...]
 
-        ref_pp = preprocess_subvolumes(ref_sv, None, tukey_alpha=0.25)
-        def_pp = preprocess_subvolumes(def_sv, None, tukey_alpha=0.25)
+        # Linear+overlap is the new pipeline default; pair it with a
+        # rectangular Tukey to mirror canonical Lewis NCC.
+        ref_pp = preprocess_subvolumes(ref_sv, None, tukey_alpha=0.0)
+        def_pp = preprocess_subvolumes(def_sv, None, tukey_alpha=0.0)
 
-        corr = correlate(ref_pp, def_pp)
+        corr = correlate(ref_pp, def_pp, mode="linear", normalization="overlap")
         integer, _ = peak_displacement(corr)
         fractional = gaussian_subvoxel_fit(corr, integer)
 

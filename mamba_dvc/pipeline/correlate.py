@@ -14,6 +14,8 @@ touching this glue.
 
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
 from jaxtyping import Bool, Float32
 
@@ -27,6 +29,16 @@ from mamba_dvc.core.window import preprocess_subvolumes
 from mamba_dvc.types import DisplacementField, POIStatus
 
 __all__ = ["correlate"]
+
+NCCMode = Literal["linear", "cyclic"]
+NCCNormalization = Literal["overlap", "global"]
+
+# Per-mode Tukey defaults. Linear NCC does not need spectral-leakage
+# suppression from a window because zero-padding eliminates the cyclic
+# wrap; the box itself plays the role of the window in the Lewis
+# denominator. Cyclic NCC retains the conventional 0.25 taper from plan
+# §2 to suppress the leakage that the wrap would otherwise inject.
+_TUKEY_DEFAULTS: dict[NCCMode, float] = {"linear": 0.0, "cyclic": 0.25}
 
 
 def _normalize_window(window: int | tuple[int, int, int]) -> tuple[int, int, int]:
@@ -48,10 +60,12 @@ def correlate(
     window: int | tuple[int, int, int] = 96,
     overlap: float = 0.5,
     mask_threshold: float = 0.9,
-    tukey_alpha: float = 0.25,
+    tukey_alpha: float | None = None,
     search_radius: int | None = None,
     batch_size: int = 256,
     eps: float = 1e-12,
+    ncc_mode: NCCMode = "linear",
+    ncc_normalization: NCCNormalization = "overlap",
 ) -> DisplacementField:
     """Run a single-pair v1 DVC pass and return a :class:`DisplacementField`.
 
@@ -79,19 +93,40 @@ def correlate(
         below this threshold are flagged ``MASKED`` in the output.
     tukey_alpha
         Taper fraction of the 3D Tukey window applied during
-        preprocessing.
+        preprocessing. ``None`` (default) resolves to a per-mode
+        default: ``0.0`` (rectangular) for ``ncc_mode="linear"`` --
+        canonical Lewis NCC needs no taper because zero-padding kills
+        the wrap-around -- and ``0.25`` for ``ncc_mode="cyclic"`` to
+        match plan §2's leakage-suppression convention.
     search_radius
         Maximum permissible integer-lag displacement along any axis.
         POIs whose integer peak exceeds this radius are flagged
         ``OUT_OF_RANGE`` and have their displacement zeroed. Defaults
-        to ``min(window) // 2``, the largest unambiguous lag for the
-        cyclic NCC.
+        to ``min(window) // 2``, the largest unambiguous lag in either
+        mode.
     batch_size
         Number of POIs processed per FFT batch. Influences peak GPU
-        memory but not the result.
+        memory but not the result. The linear kernel allocates
+        ``(batch, 2W, 2W, 2W)`` float32 buffers (~8x the cyclic
+        kernel's transient footprint); at production ``W=96`` expect
+        to drop ``batch_size`` to ~64 to fit on a single A6000. A
+        future helper in :mod:`mamba_dvc.gpu.dispatch` will recommend
+        batch sizes programmatically.
     eps
         Safety floor passed through to
         :func:`mamba_dvc.core.ncc.correlate`.
+    ncc_mode
+        ``"linear"`` (default) selects :func:`correlate_linear` --
+        zero-pads each subvolume to ``2W`` to remove the cyclic
+        wrap-around bias documented in
+        ``docs/insights/error-minimization.md``. ``"cyclic"`` selects
+        :func:`correlate_cyclic`, kept side-by-side for A/B comparison
+        and regression testing.
+    ncc_normalization
+        ``"overlap"`` (default) uses the per-lag Lewis denominator;
+        ``"global"`` uses the whole-window L2. Only meaningful when
+        ``ncc_mode="linear"`` -- ``ncc_mode="cyclic"`` requires
+        ``"global"``.
 
     Returns
     -------
@@ -133,6 +168,15 @@ def correlate(
         search_radius = min(win) // 2
     if search_radius <= 0:
         raise ValueError(f"search_radius must be positive, got {search_radius}")
+
+    if ncc_mode not in ("linear", "cyclic"):
+        raise ValueError(f"ncc_mode must be 'linear' or 'cyclic', got {ncc_mode!r}")
+    if ncc_normalization not in ("overlap", "global"):
+        raise ValueError(
+            f"ncc_normalization must be 'overlap' or 'global', got {ncc_normalization!r}"
+        )
+
+    resolved_tukey = _TUKEY_DEFAULTS[ncc_mode] if tukey_alpha is None else tukey_alpha
 
     volume_shape: tuple[int, int, int] = (
         int(reference.shape[0]),
@@ -191,10 +235,16 @@ def correlate(
         mref_sv = extract_subvolumes(effective_mask, chunk, grid.window)
         mdef_sv = extract_subvolumes(effective_def_mask, chunk, grid.window)
 
-        ref_pp = preprocess_subvolumes(ref_sv, mref_sv, tukey_alpha=tukey_alpha)
-        def_pp = preprocess_subvolumes(def_sv, mdef_sv, tukey_alpha=tukey_alpha)
+        ref_pp = preprocess_subvolumes(ref_sv, mref_sv, tukey_alpha=resolved_tukey)
+        def_pp = preprocess_subvolumes(def_sv, mdef_sv, tukey_alpha=resolved_tukey)
 
-        corr = correlate_ncc(ref_pp, def_pp, eps=eps)
+        corr = correlate_ncc(
+            ref_pp,
+            def_pp,
+            mode=ncc_mode,
+            normalization=ncc_normalization,
+            eps=eps,
+        )
         integer, peak = peak_displacement(corr)
         fractional = gaussian_subvoxel_fit(corr, integer)
 

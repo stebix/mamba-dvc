@@ -13,6 +13,25 @@ from mamba_dvc.validate.synthetic import make_pair, rigid_shift, sample_on_grid
 correlate_checked = jaxtyped(typechecker=beartype)(correlate)
 
 
+# Pipeline-level NCC mode sweep. Each entry expands into the kwargs the
+# pipeline accepts; the linear+overlap pair is the default and the
+# cyclic+global pair is the legacy code path retained for A/B work.
+NCC_MODES = [
+    pytest.param(
+        {"ncc_mode": "linear", "ncc_normalization": "overlap"},
+        id="linear-overlap",
+    ),
+    pytest.param(
+        {"ncc_mode": "linear", "ncc_normalization": "global"},
+        id="linear-global",
+    ),
+    pytest.param(
+        {"ncc_mode": "cyclic", "ncc_normalization": "global"},
+        id="cyclic-global",
+    ),
+]
+
+
 class TestSignatureAndStructure:
     def test_returns_displacementfield_with_expected_shapes(self):
         rng = np.random.default_rng(0)
@@ -48,11 +67,12 @@ class TestSignatureAndStructure:
 
 
 class TestZeroShift:
-    def test_recovers_zero_displacement_everywhere(self):
+    @pytest.mark.parametrize("ncc_kwargs", NCC_MODES)
+    def test_recovers_zero_displacement_everywhere(self, ncc_kwargs):
         rng = np.random.default_rng(2)
         ref = rng.standard_normal((48, 48, 48), dtype=np.float32)
 
-        field = correlate(ref, ref, window=24, overlap=0.5, search_radius=8)
+        field = correlate(ref, ref, window=24, overlap=0.5, search_radius=8, **ncc_kwargs)
 
         assert field.valid.all()
         assert (field.status == POIStatus.OK).all()
@@ -208,6 +228,131 @@ class TestInputValidation:
         ref = np.zeros((32, 32, 32), dtype=np.float32)
         with pytest.raises(ValueError, match="search_radius"):
             correlate(ref, ref, window=16, search_radius=0)
+
+    def test_unknown_ncc_mode_raises(self):
+        ref = np.zeros((32, 32, 32), dtype=np.float32)
+        with pytest.raises(ValueError, match="ncc_mode"):
+            correlate(ref, ref, window=16, ncc_mode="bogus")  # type: ignore[arg-type]
+
+    def test_unknown_ncc_normalization_raises(self):
+        ref = np.zeros((32, 32, 32), dtype=np.float32)
+        with pytest.raises(ValueError, match="ncc_normalization"):
+            correlate(ref, ref, window=16, ncc_normalization="bogus")  # type: ignore[arg-type]
+
+
+class TestNCCModeKnobs:
+    def test_per_mode_tukey_default_resolves(self):
+        # tukey_alpha=None should pick 0.0 in linear mode and 0.25 in
+        # cyclic. The visible signature is identical; we verify the
+        # resolution by comparing against an explicit alpha that
+        # matches the per-mode default.
+        rng = np.random.default_rng(11)
+        ref = rng.standard_normal((48, 48, 48), dtype=np.float32)
+        deformed = np.roll(ref, shift=(1, -1, 2), axis=(0, 1, 2))
+
+        f_lin_auto = correlate(
+            ref,
+            deformed,
+            window=24,
+            overlap=0.5,
+            search_radius=8,
+            ncc_mode="linear",
+            ncc_normalization="overlap",
+        )
+        f_lin_explicit = correlate(
+            ref,
+            deformed,
+            window=24,
+            overlap=0.5,
+            search_radius=8,
+            tukey_alpha=0.0,
+            ncc_mode="linear",
+            ncc_normalization="overlap",
+        )
+        np.testing.assert_allclose(
+            f_lin_auto.displacements, f_lin_explicit.displacements, atol=1e-6
+        )
+
+        f_cyc_auto = correlate(
+            ref,
+            deformed,
+            window=24,
+            overlap=0.5,
+            search_radius=8,
+            ncc_mode="cyclic",
+            ncc_normalization="global",
+        )
+        f_cyc_explicit = correlate(
+            ref,
+            deformed,
+            window=24,
+            overlap=0.5,
+            search_radius=8,
+            tukey_alpha=0.25,
+            ncc_mode="cyclic",
+            ncc_normalization="global",
+        )
+        np.testing.assert_allclose(
+            f_cyc_auto.displacements, f_cyc_explicit.displacements, atol=1e-6
+        )
+
+    @pytest.mark.slow
+    def test_linear_overlap_beats_cyclic_on_fractional_shift(self):
+        # Showcase regime from docs/insights/error-minimization.md:
+        # window 32 on a textured volume with a non-trivial shift. The
+        # cyclic+global combo carries the |u|/W shrinkage bias; the
+        # linear+overlap default should land closer to ground truth.
+        shift = (1.5, -2.3, 0.7)
+        shape: tuple[int, int, int] = (96, 128, 128)
+        pair = make_pair(shape=shape, field=rigid_shift(shift), seed=23)
+
+        common = dict(window=32, overlap=0.5, search_radius=8)
+        f_linear = correlate(
+            pair.reference,
+            pair.deformed,
+            ncc_mode="linear",
+            ncc_normalization="overlap",
+            **common,
+        )
+        f_cyclic = correlate(
+            pair.reference,
+            pair.deformed,
+            ncc_mode="cyclic",
+            ncc_normalization="global",
+            **common,
+        )
+
+        # Compare on the interior valid POIs only (boundary POIs see
+        # truncation effects that dominate the kernel's intrinsic
+        # bias).
+        from mamba_dvc.core.grid import build_grid
+
+        grid = build_grid(shape, window=(32, 32, 32), overlap=0.5)
+        gt = sample_on_grid(pair.field, grid)
+        starts = f_linear.positions - (np.asarray(f_linear.window, dtype=np.float32) - 1) / 2.0
+        wz, wy, wx = f_linear.window
+        margin = 8
+        interior = (
+            (starts[:, 0] >= margin)
+            & (starts[:, 0] + wz <= shape[0] - margin)
+            & (starts[:, 1] >= margin)
+            & (starts[:, 1] + wy <= shape[1] - margin)
+            & (starts[:, 2] >= margin)
+            & (starts[:, 2] + wx <= shape[2] - margin)
+        )
+        usable = interior & f_linear.valid & f_cyclic.valid
+
+        mae_linear = np.abs(f_linear.displacements[usable] - gt[usable]).mean(axis=0)
+        mae_cyclic = np.abs(f_cyclic.displacements[usable] - gt[usable]).mean(axis=0)
+
+        # Strict regression on the new default; the loose "less than"
+        # check on cyclic captures the bias without depending on its
+        # exact magnitude.
+        assert mae_linear.max() < 0.1, f"linear+overlap MAE {mae_linear} above 0.1 budget"
+        assert mae_linear.max() < mae_cyclic.max(), (
+            f"linear+overlap MAE {mae_linear} should be lower than cyclic MAE "
+            f"{mae_cyclic} on the showcase regime"
+        )
 
 
 @pytest.mark.slow
