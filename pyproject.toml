@@ -16,10 +16,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-reactive-viz = [
+viz = [
     "ipympl>=0.10.0",
     "ipywidgets>=8.1.8",
     "jupyter>=1.1.1",
+    "matplotlib>=3.9",
+    "nest-asyncio2>=1.7.2",
+    "pyvista>=0.45",
+    "trame>=3.0",
+    "trame-vtk>=2.8",
+    "trame-vuetify>=2.7",
 ]
 
 [dependency-groups]
@@ -78,7 +84,10 @@ docstring-code-format = true
 
 [tool.pyright]
 include = ["mamba_dvc"]
-exclude = ["**/__pycache__", "**/.venv", "build", "dist"]
+# viz is an optional extra and depends on pyvista, which ships no type stubs.
+# Strict checking would emit a wall of unknown-type warnings on every PyVista
+# call. Renderer return types are still annotated for editor introspection.
+exclude = ["**/__pycache__", "**/.venv", "build", "dist", "mamba_dvc/viz"]
 pythonVersion = "3.14"
 pythonPlatform = "Windows"
 typeCheckingMode = "strict"
@@ -100,4 +109,5 @@ addopts = [
 markers = [
     "gpu: tests that require a CUDA-capable GPU",
     "slow: tests that take more than a few seconds",
+    "viz: tests that require the optional viz extra (pyvista, matplotlib, ipywidgets)",
 ]
