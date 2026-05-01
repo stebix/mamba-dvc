@@ -47,6 +47,10 @@ packages = ["mamba_dvc"]
 line-length = 95
 target-version = "py314"
 src = ["mamba_dvc"]
+# Notebooks under notebooks/ are scratch / exploration. They go through
+# the nbstripout clean filter on commit but are not held to package
+# style.
+extend-exclude = ["notebooks"]
 
 [tool.ruff.lint]
 select = [
