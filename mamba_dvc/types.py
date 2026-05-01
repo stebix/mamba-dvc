@@ -16,11 +16,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Literal
 
 import numpy as np
 from jaxtyping import Bool, Float32, Int64, UInt8
 
-__all__ = ["DisplacementField", "GridSpec", "POIStatus"]
+__all__ = ["DisplacementField", "GridSpec", "POIStatus", "PhysicalUnit", "VoxelSpacing"]
+
+
+PhysicalUnit = Literal["voxel", "nm", "um", "mm"]
+"""Physical unit attached to a :class:`VoxelSpacing`.
+
+``"voxel"`` is the unit-agnostic default for synthetic / pre-IO data;
+``"nm" | "um" | "mm"`` are the physical units that flow in once
+``mamba_dvc.io`` lands. Visualization unit math (the only place this is
+read at runtime) lives in :mod:`mamba_dvc.viz._conversion`.
+"""
 
 
 class POIStatus(IntEnum):
@@ -147,3 +158,50 @@ class DisplacementField:
     grid_shape: tuple[int, int, int]
     spacing: tuple[int, int, int]
     window: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class VoxelSpacing:
+    """Per-axis voxel spacing with an explicit physical unit.
+
+    Carried alongside volumes (and emitted by ``mamba_dvc.io.volume``
+    once it lands). The numeric :attr:`values` are unitless; :attr:`unit`
+    names the physical interpretation. The default ``unit="voxel"``
+    keeps synthetic / pre-IO data unit-agnostic.
+
+    Parameters
+    ----------
+    values
+        ``(z, y, x)`` spacings, strictly positive. Same dtype as the
+        host ``float`` (Python floats, kept as a tuple for hashability).
+    unit
+        Physical interpretation of :attr:`values`. One of
+        ``"voxel" | "nm" | "um" | "mm"``. Defaults to ``"voxel"``.
+
+    Raises
+    ------
+    ValueError
+        If :attr:`values` does not have length 3 or contains a
+        non-positive entry.
+
+    Notes
+    -----
+    All unit arithmetic is centralized in
+    :func:`mamba_dvc.viz._conversion.unify_spacing`; renderers consume
+    :class:`VoxelSpacing` opaquely. Mixed ``"voxel"`` + physical-unit
+    composition is a hard error there, not a silent conversion.
+
+    Per-axis differing units (e.g. nm in xy, µm in z on legacy TIFF
+    stacks) are deferred. The dataclass shape leaves room to extend
+    :attr:`unit` to a 3-tuple without breaking signatures.
+    """
+
+    values: tuple[float, float, float]
+    unit: PhysicalUnit = "voxel"
+
+    def __post_init__(self) -> None:
+        """Validate spacing length and positivity."""
+        if len(self.values) != 3:
+            raise ValueError(f"values must have length 3, got {len(self.values)}")
+        if any(v <= 0.0 for v in self.values):
+            raise ValueError(f"values entries must be positive, got {self.values}")
