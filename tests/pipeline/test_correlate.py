@@ -6,6 +6,9 @@ import numpy as np
 import pytest
 from beartype import beartype
 from jaxtyping import jaxtyped
+from mamba_dvc.core.grid import build_grid
+from mamba_dvc.core.outlier import detect_outliers
+from mamba_dvc.pipeline._internal import TUKEY_DEFAULTS, correlate_admitted_subset
 from mamba_dvc.pipeline.correlate import correlate
 from mamba_dvc.types import DisplacementField, POIStatus
 from mamba_dvc.validate.synthetic import make_pair, rigid_shift, sample_on_grid
@@ -402,8 +405,6 @@ class TestEndToEndAccuracy:
 
 def _grid_from_field(field: DisplacementField):
     """Reconstruct the GridSpec used internally for ground-truth sampling."""
-    from mamba_dvc.core.grid import build_grid
-
     # The field's positions correspond to the same grid build_grid
     # would produce given the same volume shape, window, and overlap.
     # We back out the volume shape from positions + window; for the
@@ -418,3 +419,291 @@ def _grid_from_field(field: DisplacementField):
     )
     overlap = 1.0 - sz / wz
     return build_grid(volume_shape, window=field.window, overlap=overlap)
+
+
+# Default helper kwargs used across the dispatch-seam tests below. The
+# linear+overlap mode is the pipeline default; tukey_alpha=0.0 is what
+# the orchestrator resolves at the linear branch.
+_HELPER_KWARGS = dict(
+    batch_size=64,
+    eps=1e-12,
+    ncc_mode="linear",
+    ncc_normalization="overlap",
+    tukey_alpha=TUKEY_DEFAULTS["linear"],
+)
+
+
+class TestCorrelateAdmittedSubset:
+    """Direct tests of the dispatch-seam helper.
+
+    The helper is what each multi-GPU worker calls on its share of the
+    admitted POIs (plan §6). These tests pin its contract: full-length
+    sparse output with ``MASKED`` outside ``admitted_idx``, OK /
+    OUT_OF_RANGE inside, and disjoint shards that scatter back into the
+    same arrays a single full-admitted call produces.
+    """
+
+    @staticmethod
+    def _smooth_pair(
+        shape: tuple[int, int, int] = (48, 48, 48),
+        shift: tuple[float, float, float] = (0.4, -0.6, 0.9),
+        seed: int = 17,
+    ):
+        pair = make_pair(shape=shape, field=rigid_shift(shift), seed=seed)
+        return pair.reference, pair.deformed
+
+    def test_helper_plus_outlier_overlay_equals_correlate(self):
+        # Spec: correlate() == correlate_admitted_subset(full_admitted)
+        # followed by the outlier overlay step. Run both and assert
+        # bit-identical (within float32 noise) at every slot.
+        ref, deformed = self._smooth_pair()
+        window = 24
+        search_radius = 8
+
+        field = correlate(
+            ref, deformed, window=window, overlap=0.5, search_radius=search_radius
+        )
+
+        grid = build_grid(ref.shape, window=window, overlap=0.5)
+        n_points = int(np.prod(grid.grid_shape))
+        admitted_idx = np.arange(n_points, dtype=np.int64)
+        eff_mask = np.ones(ref.shape, dtype=np.bool_)
+
+        h_disp, h_conf, h_stat = correlate_admitted_subset(
+            ref,
+            deformed,
+            eff_mask,
+            eff_mask,
+            grid,
+            admitted_idx,
+            search_radius=search_radius,
+            **_HELPER_KWARGS,
+        )
+
+        # Apply the same outlier overlay correlate runs after the helper.
+        valid_pre = h_stat == POIStatus.OK
+        outlier_flag = detect_outliers(grid, h_disp, valid_pre)
+        h_disp[outlier_flag] = 0.0
+        h_conf[outlier_flag] = 0.0
+        h_stat[outlier_flag] = POIStatus.OUTLIER
+
+        np.testing.assert_array_equal(h_stat, field.status)
+        np.testing.assert_allclose(h_disp, field.displacements, atol=1e-6)
+        np.testing.assert_allclose(h_conf, field.confidence, atol=1e-6)
+
+    def test_helper_plus_outlier_overlay_equals_correlate_with_mask(self):
+        # Same equivalence but with mask admission active. We mirror
+        # the orchestrator's filter_by_mask -> flatnonzero step to
+        # build the helper's admitted_idx.
+        from mamba_dvc.core.grid import filter_by_mask
+
+        rng = np.random.default_rng(31)
+        shape = (48, 48, 48)
+        ref = rng.standard_normal(shape, dtype=np.float32)
+        deformed = np.roll(ref, shift=1, axis=0)
+        mask = np.ones(shape, dtype=np.bool_)
+        mask[:8, :, :] = False  # exclude the first 8 z-slices
+        window = 24
+        search_radius = 8
+
+        field = correlate(
+            ref,
+            deformed,
+            mask,
+            window=window,
+            overlap=0.5,
+            mask_threshold=0.9,
+            search_radius=search_radius,
+        )
+
+        grid = build_grid(shape, window=window, overlap=0.5)
+        admitted = filter_by_mask(grid, mask, threshold=0.9)
+        admitted_idx = np.flatnonzero(admitted).astype(np.int64)
+
+        h_disp, h_conf, h_stat = correlate_admitted_subset(
+            ref,
+            deformed,
+            mask,
+            mask,
+            grid,
+            admitted_idx,
+            search_radius=search_radius,
+            **_HELPER_KWARGS,
+        )
+
+        valid_pre = h_stat == POIStatus.OK
+        outlier_flag = detect_outliers(grid, h_disp, valid_pre)
+        h_disp[outlier_flag] = 0.0
+        h_conf[outlier_flag] = 0.0
+        h_stat[outlier_flag] = POIStatus.OUTLIER
+
+        np.testing.assert_array_equal(h_stat, field.status)
+        np.testing.assert_allclose(h_disp, field.displacements, atol=1e-6)
+        np.testing.assert_allclose(h_conf, field.confidence, atol=1e-6)
+
+    def test_disjoint_shards_scatter_to_full(self):
+        # Plan §6 sharding: partition admitted_idx along lattice-Z into
+        # contiguous slabs, run helper per shard, scatter each shard's
+        # slots into the parent buffers, expect the result to match a
+        # single full-admitted call. This is the invariant that makes
+        # multi-GPU dispatch correct.
+        ref, deformed = self._smooth_pair()
+        window = 24
+        search_radius = 8
+
+        grid = build_grid(ref.shape, window=window, overlap=0.5)
+        n_points = int(np.prod(grid.grid_shape))
+        eff_mask = np.ones(ref.shape, dtype=np.bool_)
+
+        all_admitted = np.arange(n_points, dtype=np.int64)
+        ref_disp, ref_conf, ref_stat = correlate_admitted_subset(
+            ref,
+            deformed,
+            eff_mask,
+            eff_mask,
+            grid,
+            all_admitted,
+            search_radius=search_radius,
+            **_HELPER_KWARGS,
+        )
+
+        # Build three disjoint shards along lattice-Z (mirrors the
+        # contiguous-slab partition the dispatch layer will produce).
+        nz = grid.grid_shape[0]
+        z_chunks = np.array_split(np.arange(nz, dtype=np.int64), 3)
+        shards: list[np.ndarray] = []
+        for chunk in z_chunks:
+            mask_lat = np.zeros(grid.grid_shape, dtype=np.bool_)
+            mask_lat[chunk[0] : chunk[-1] + 1] = True
+            shards.append(np.flatnonzero(mask_lat).astype(np.int64))
+
+        # Sanity: shards are disjoint and cover every POI.
+        union = np.concatenate(shards)
+        assert union.size == n_points
+        np.testing.assert_array_equal(np.sort(union), all_admitted)
+
+        # Parent allocates full-length buffers (default-init MASKED /
+        # zero) and scatters each shard's slots in.
+        merged_disp = np.zeros((n_points, 3), dtype=np.float32)
+        merged_conf = np.zeros(n_points, dtype=np.float32)
+        merged_stat = np.full(n_points, POIStatus.MASKED, dtype=np.uint8)
+
+        for shard_idx in shards:
+            s_disp, s_conf, s_stat = correlate_admitted_subset(
+                ref,
+                deformed,
+                eff_mask,
+                eff_mask,
+                grid,
+                shard_idx,
+                search_radius=search_radius,
+                **_HELPER_KWARGS,
+            )
+            merged_disp[shard_idx] = s_disp[shard_idx]
+            merged_conf[shard_idx] = s_conf[shard_idx]
+            merged_stat[shard_idx] = s_stat[shard_idx]
+
+        np.testing.assert_array_equal(merged_stat, ref_stat)
+        np.testing.assert_allclose(merged_disp, ref_disp, atol=1e-6)
+        np.testing.assert_allclose(merged_conf, ref_conf, atol=1e-6)
+
+    def test_non_shard_slots_are_masked(self):
+        # Sparse-output contract: indices outside admitted_idx come back
+        # MASKED with zero displacement / confidence. This is what lets
+        # the dispatch parent rely on per-shard scatter without merging
+        # logic.
+        ref, deformed = self._smooth_pair()
+        window = 24
+        grid = build_grid(ref.shape, window=window, overlap=0.5)
+        n_points = int(np.prod(grid.grid_shape))
+        eff_mask = np.ones(ref.shape, dtype=np.bool_)
+
+        admitted_idx = np.arange(n_points // 2, dtype=np.int64)
+
+        h_disp, h_conf, h_stat = correlate_admitted_subset(
+            ref,
+            deformed,
+            eff_mask,
+            eff_mask,
+            grid,
+            admitted_idx,
+            search_radius=8,
+            **_HELPER_KWARGS,
+        )
+
+        non_shard = np.ones(n_points, dtype=np.bool_)
+        non_shard[admitted_idx] = False
+        assert (h_stat[non_shard] == POIStatus.MASKED).all()
+        np.testing.assert_array_equal(h_disp[non_shard], 0.0)
+        np.testing.assert_array_equal(h_conf[non_shard], 0.0)
+        # Shard slots: every status is either OK or OUT_OF_RANGE. The
+        # helper does not run the outlier test, so OUTLIER must not
+        # appear.
+        shard_stat = h_stat[admitted_idx]
+        ok_or_oor = (shard_stat == POIStatus.OK) | (shard_stat == POIStatus.OUT_OF_RANGE)
+        assert ok_or_oor.all()
+
+    def test_empty_admitted_idx_returns_all_masked(self):
+        # Degenerate but real: a Z-slab with no admitted POIs (e.g.
+        # entirely covered by the screw mask) should produce a clean
+        # all-MASKED, all-zero result without indexing into empty
+        # batches.
+        ref, deformed = self._smooth_pair()
+        window = 24
+        grid = build_grid(ref.shape, window=window, overlap=0.5)
+        n_points = int(np.prod(grid.grid_shape))
+        eff_mask = np.ones(ref.shape, dtype=np.bool_)
+
+        empty = np.empty(0, dtype=np.int64)
+
+        h_disp, h_conf, h_stat = correlate_admitted_subset(
+            ref,
+            deformed,
+            eff_mask,
+            eff_mask,
+            grid,
+            empty,
+            search_radius=8,
+            **_HELPER_KWARGS,
+        )
+
+        assert h_disp.shape == (n_points, 3)
+        assert h_conf.shape == (n_points,)
+        assert h_stat.shape == (n_points,)
+        assert (h_stat == POIStatus.MASKED).all()
+        np.testing.assert_array_equal(h_disp, 0.0)
+        np.testing.assert_array_equal(h_conf, 0.0)
+
+    def test_out_of_range_zeroes_and_flags_only_admitted(self):
+        # Search-radius gate is a per-POI check inside the helper. When
+        # the integer peak escapes the radius, the slot is flagged
+        # OUT_OF_RANGE with zero disp/conf -- but only at admitted
+        # slots; non-admitted slots stay MASKED.
+        rng = np.random.default_rng(99)
+        ref = rng.standard_normal((48, 48, 48), dtype=np.float32)
+        deformed = np.roll(ref, shift=6, axis=0)
+        window = 24
+        grid = build_grid(ref.shape, window=window, overlap=0.5)
+        n_points = int(np.prod(grid.grid_shape))
+        eff_mask = np.ones(ref.shape, dtype=np.bool_)
+
+        admitted_idx = np.arange(n_points // 2, dtype=np.int64)
+
+        h_disp, h_conf, h_stat = correlate_admitted_subset(
+            ref,
+            deformed,
+            eff_mask,
+            eff_mask,
+            grid,
+            admitted_idx,
+            search_radius=3,
+            **_HELPER_KWARGS,
+        )
+
+        assert (h_stat[admitted_idx] == POIStatus.OUT_OF_RANGE).all()
+        np.testing.assert_array_equal(h_disp[admitted_idx], 0.0)
+        np.testing.assert_array_equal(h_conf[admitted_idx], 0.0)
+
+        non_shard = np.ones(n_points, dtype=np.bool_)
+        non_shard[admitted_idx] = False
+        assert (h_stat[non_shard] == POIStatus.MASKED).all()
