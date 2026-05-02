@@ -132,7 +132,7 @@ mamba_dvc/
 Array shapes are encoded in the type system via [`jaxtyping`](https://github.com/patrick-kidger/jaxtyping). Shape symbols (`Z`, `Y`, `X`, `N`) are consistent across the codebase and documented once in `types.py`. Runtime checking is opt-in via `jaxtyped`/`beartype` in tests; production code uses the annotations for static review by `pyright` and for documentation.
 
 ```python
-# mamba_dvc/pipeline/correlate.py
+# mamba_dvc/pipeline/correlate.py — single-device pure function
 
 from jaxtyping import Bool, Float32
 
@@ -144,12 +144,35 @@ def correlate(
     window: int | tuple[int, int, int] = 96,
     overlap: float = 0.5,
     mask_threshold: float = 0.9,
-    tukey_alpha: float = 0.25,
-    search_radius: int | None = None,          # default: min(window) // 2
-    outlier_eps: float = 0.1,
-    device_ids: Sequence[int] | None = None,   # None → all visible GPUs
+    tukey_alpha: float | None = None,           # per-mode default (linear=0.0, cyclic=0.25)
+    search_radius: int | None = None,           # default: min(window) // 2
+    batch_size: int = 256,
+    eps: float = 1e-12,
+    ncc_mode: Literal["linear", "cyclic"] = "linear",
+    ncc_normalization: Literal["overlap", "global"] = "overlap",
 ) -> DisplacementField: ...
 ```
+
+```python
+# mamba_dvc/gpu/dispatch.py — multi-GPU sibling
+
+def correlate_multi_gpu(
+    reference: Float32[np.ndarray, "Z Y X"],
+    deformed: Float32[np.ndarray, "Z Y X"],
+    mask: Bool[np.ndarray, "Z Y X"] | None = None,
+    deformed_mask: Bool[np.ndarray, "Z Y X"] | None = None,
+    *,
+    device_ids: Sequence[int] | None = None,    # None → all visible GPUs
+    # ...remaining args identical to correlate(); batch_size defaults to 64...
+) -> DisplacementField: ...
+```
+
+`correlate()` is the pure single-device path required by the §4
+pure-core rule. `correlate_multi_gpu()` lives in `gpu/dispatch.py` and
+shells out to one CuPy worker per device, sharing the same algorithmic
+core via the private helper `pipeline.correlate._correlate_admitted_subset`.
+See `docs/plans/dispatch.md` for the dispatch contract and worker
+lifecycle.
 
 ```python
 # mamba_dvc/types.py
