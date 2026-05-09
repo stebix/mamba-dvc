@@ -16,6 +16,8 @@ import pytest
 from beartype import beartype
 from jaxtyping import jaxtyped
 from mamba_dvc.core.ncc import (
+    NCCMode,
+    NCCNormalization,
     correlate,
     correlate_cyclic,
     correlate_linear,
@@ -200,7 +202,9 @@ class TestDispatcherValidation:
     def test_runtime_shape_check_via_jaxtyping(self):
         rng = np.random.default_rng(6)
         ref = _zero_mean(rng.standard_normal((2, 6, 6, 6), dtype=np.float32))
-        corr = correlate_checked(ref, ref, mode="linear", normalization="overlap")
+        corr = correlate_checked(
+            ref, ref, mode=NCCMode.LINEAR, normalization=NCCNormalization.OVERLAP
+        )
         assert corr.shape == (2, 6, 6, 6)
 
 

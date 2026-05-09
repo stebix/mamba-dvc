@@ -55,7 +55,8 @@ programmatically.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from enum import StrEnum
+from typing import Any
 
 import numpy as np
 from jaxtyping import Float32, Int64
@@ -66,14 +67,27 @@ except ImportError:  # pragma: no cover - exercised on CPU-only machines
     _cp = None  # type: ignore[assignment]
 
 __all__ = [
+    "NCCMode",
+    "NCCNormalization",
     "correlate",
     "correlate_cyclic",
     "correlate_linear",
     "peak_displacement",
 ]
 
-NCCMode = Literal["cyclic", "linear"]
-NCCNormalization = Literal["global", "overlap"]
+
+class NCCMode(StrEnum):
+    """FFT-NCC kernel selection."""
+
+    CYCLIC = "cyclic"
+    LINEAR = "linear"
+
+
+class NCCNormalization(StrEnum):
+    """Per-POI denominator convention for the FFT-NCC kernel."""
+
+    GLOBAL = "global"
+    OVERLAP = "overlap"
 
 
 def _array_module(array: Any) -> Any:
@@ -251,8 +265,13 @@ def correlate_linear(
     production window sizes.
     """
     xp = _validate_pair(reference, deformed, eps)
-    if normalization not in ("overlap", "global"):
-        raise ValueError(f"normalization must be 'overlap' or 'global', got {normalization!r}")
+    try:
+        normalization = NCCNormalization(normalization)
+    except ValueError as exc:
+        raise ValueError(
+            f"normalization must be one of {[m.value for m in NCCNormalization]}, "
+            f"got {normalization!r}"
+        ) from exc
 
     batch, wz, wy, wx = reference.shape
     window = (wz, wy, wx)
@@ -270,12 +289,12 @@ def correlate_linear(
     numerator_full = xp.fft.irfftn(cross_power, s=padded_shape, axes=fft_axes)
     numerator = _crop_padded_to_cyclic(numerator_full, window, fft_axes, xp)
 
-    if normalization == "global":
+    if normalization is NCCNormalization.GLOBAL:
         ref_sq = (reference.astype(xp.float64) ** 2).sum(axis=(1, 2, 3))
         def_sq = (deformed.astype(xp.float64) ** 2).sum(axis=(1, 2, 3))
         denom = xp.sqrt(ref_sq * def_sq + xp.float64(eps)).astype(xp.float32)
         corr = numerator / denom[:, None, None, None]
-    else:  # "overlap"
+    else:  # NCCNormalization.OVERLAP
         ref_sq_padded = ref_padded * ref_padded
         def_sq_padded = def_padded * def_padded
         spectrum_ref_sq = xp.fft.rfftn(ref_sq_padded, axes=fft_axes)
@@ -360,17 +379,29 @@ def correlate(
         ``mode`` or ``normalization`` values, or the unsupported
         combination ``mode="cyclic"`` with ``normalization="overlap"``.
     """
-    if mode == "cyclic":
-        if normalization != "global":
+    try:
+        mode = NCCMode(mode)
+    except ValueError as exc:
+        raise ValueError(
+            f"mode must be one of {[m.value for m in NCCMode]}, got {mode!r}"
+        ) from exc
+    try:
+        normalization = NCCNormalization(normalization)
+    except ValueError as exc:
+        raise ValueError(
+            f"normalization must be one of {[m.value for m in NCCNormalization]}, "
+            f"got {normalization!r}"
+        ) from exc
+
+    if mode is NCCMode.CYCLIC:
+        if normalization is not NCCNormalization.GLOBAL:
             raise ValueError(
                 f"mode='cyclic' supports only normalization='global', "
-                f"got normalization={normalization!r}; use mode='linear' "
+                f"got normalization={normalization.value!r}; use mode='linear' "
                 f"for overlap-aware Lewis normalization"
             )
         return correlate_cyclic(reference, deformed, eps=eps)
-    if mode == "linear":
-        return correlate_linear(reference, deformed, normalization=normalization, eps=eps)
-    raise ValueError(f"mode must be 'linear' or 'cyclic', got {mode!r}")
+    return correlate_linear(reference, deformed, normalization=normalization, eps=eps)
 
 
 def peak_displacement(

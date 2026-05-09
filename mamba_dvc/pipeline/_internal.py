@@ -36,14 +36,14 @@ merging logic is required.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 from jaxtyping import Bool, Float32, Int64, UInt8
 
 from mamba_dvc.core.extract import extract_subvolumes
+from mamba_dvc.core.ncc import NCCMode, NCCNormalization, peak_displacement
 from mamba_dvc.core.ncc import correlate as correlate_ncc
-from mamba_dvc.core.ncc import peak_displacement
 from mamba_dvc.core.peakfit import gaussian_subvoxel_fit
 from mamba_dvc.core.window import preprocess_subvolumes
 from mamba_dvc.types import GridSpec, POIStatus
@@ -62,15 +62,12 @@ __all__ = [
     "resolve_masks",
 ]
 
-NCCMode = Literal["linear", "cyclic"]
-NCCNormalization = Literal["overlap", "global"]
-
 # Per-mode Tukey defaults. Linear NCC does not need spectral-leakage
 # suppression from a window because zero-padding eliminates the cyclic
 # wrap; the box itself plays the role of the window in the Lewis
 # denominator. Cyclic NCC retains the conventional 0.25 taper from
 # plan §2 to suppress the leakage that the wrap would otherwise inject.
-TUKEY_DEFAULTS: dict[NCCMode, float] = {"linear": 0.0, "cyclic": 0.25}
+TUKEY_DEFAULTS: dict[NCCMode, float] = {NCCMode.LINEAR: 0.0, NCCMode.CYCLIC: 0.25}
 
 
 def _array_module(array: Any) -> Any:

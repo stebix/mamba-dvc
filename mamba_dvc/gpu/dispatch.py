@@ -416,8 +416,8 @@ def correlate_multi_gpu(
     search_radius: int | None = None,
     batch_size: int = 64,
     eps: float = 1e-12,
-    ncc_mode: NCCMode = "linear",
-    ncc_normalization: NCCNormalization = "overlap",
+    ncc_mode: NCCMode = NCCMode.LINEAR,
+    ncc_normalization: NCCNormalization = NCCNormalization.OVERLAP,
 ) -> DisplacementField:
     """Run a single-pair v1 DVC pass across one or more GPUs.
 
@@ -494,12 +494,19 @@ def correlate_multi_gpu(
         search_radius = min(win) // 2
     if search_radius <= 0:
         raise ValueError(f"search_radius must be positive, got {search_radius}")
-    if ncc_mode not in ("linear", "cyclic"):
-        raise ValueError(f"ncc_mode must be 'linear' or 'cyclic', got {ncc_mode!r}")
-    if ncc_normalization not in ("overlap", "global"):
+    try:
+        ncc_mode = NCCMode(ncc_mode)
+    except ValueError as exc:
         raise ValueError(
-            f"ncc_normalization must be 'overlap' or 'global', got {ncc_normalization!r}"
-        )
+            f"ncc_mode must be one of {[m.value for m in NCCMode]}, got {ncc_mode!r}"
+        ) from exc
+    try:
+        ncc_normalization = NCCNormalization(ncc_normalization)
+    except ValueError as exc:
+        raise ValueError(
+            f"ncc_normalization must be one of {[m.value for m in NCCNormalization]}, "
+            f"got {ncc_normalization!r}"
+        ) from exc
 
     resolved_tukey = TUKEY_DEFAULTS[ncc_mode] if tukey_alpha is None else tukey_alpha
 
