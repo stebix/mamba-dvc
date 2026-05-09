@@ -736,6 +736,39 @@ profile + manifest contract and there is no clean overlap. Existing
 invocations need updating; the script's `--report` / `--out` /
 `--device-ids` / window / batch / NCC flags survive unchanged.
 
+### Discoverability — `mamba-dvc inspect`
+
+Sibling to `run_e2e_zarr.py`: a no-side-effect CLI that opens a store
+through `DvcDataset.open(strict=False)`, prints the verifier outcome,
+and renders a `rich.tree.Tree` of every parsed slot. Lives at
+`mamba_dvc/cli.py`; entry point is `[project.scripts] mamba-dvc =
+"mamba_dvc.cli:app"`. The compute pipeline is untouched — the
+inspector reads metadata and flags only.
+
+```
+mamba-dvc inspect <path> [--manifest YAML] [--profile NAME]
+                         [--verbose] [--json] [--no-color]
+```
+
+| Flag | Effect |
+|---|---|
+| `--manifest <yaml>` | Skip sidecar / `.zattrs` discovery; load this manifest. |
+| `--profile <name>` | Synthesize a `StoreManifest(profile_name=...)`, merging on top of any discovered manifest. Errors fast on an unregistered name. |
+| `--verbose` | Append `chunks=…`, `codecs=…`, and on-disk size per array leaf. |
+| `--json` | Emit a machine-readable inventory + verifier report instead of the rich tree. |
+
+Exit codes: `0` = clean, `1` = verifier reported errors (tree still
+rendered), `2` = could not open (missing path, bad manifest, unknown
+profile). The `1` path is the load-bearing one for scripting — CI can
+gate uploads on `mamba-dvc inspect --json` returning `ok=true`.
+
+The header labels the manifest source explicitly: `none`,
+`sidecar yaml (<file>)`, `root .zattrs`, `--manifest <name>`, or
+`--profile <name> (over <other source>)`. This is the discoverability
+piece — a notebook user staring at an unfamiliar store can run
+`mamba-dvc inspect` and see exactly which schema artifact the loader
+would resolve.
+
 ## 7. Test surface
 
 Pure-CPU, no GPU, no real data:
@@ -871,6 +904,12 @@ test additions called out in §7.
 9. Update `docs/plans/overview.md` §4 `io/` description to reference
    this doc; mark §9 tier-2 entry as "implemented in
    `validate/known_fields.py`, see `docs/plans/zarr-interface.md`".
+10. `mamba_dvc/cli.py`: typer-based `mamba-dvc inspect` (rich tree +
+    validity panel + `--verbose` / `--json` / `--profile`). Adds
+    **typer** and **rich** as runtime dependencies and registers the
+    `mamba-dvc` console script. Tests: `tests/cli/test_inspect.py`
+    (happy path, manifest override, verifier failure, missing path,
+    unknown profile, `--verbose`, `--json` × 2, `--profile`).
 
 ## 10. Known non-features (by design, v1)
 
