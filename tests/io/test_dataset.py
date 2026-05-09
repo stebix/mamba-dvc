@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
 import pytest
-from mamba_dvc.io.dataset import NO_MASK, DvcDataset
+from mamba_dvc.io.dataset import (
+    NO_MASK,
+    BrokenEntry,
+    DvcDataset,
+    MalformedStoreError,
+)
 from mamba_dvc.io.field import GroundTruthField
 from mamba_dvc.io.manifest import (
     BaseManifest,
@@ -189,3 +195,109 @@ class TestManifestSubset:
         )
         ds = DvcDataset.open(path, manifest=manifest)
         assert ds.list_real() == ["024"]
+
+
+class TestBrokenEntries:
+    """Per-entry failures surface as ``BrokenEntry`` records, not exceptions."""
+
+    def test_synthetic_missing_volume1(self, make_disk_store: DiskStoreFactory) -> None:
+        path = make_disk_store(profile=PROFILE)
+        shutil.rmtree(path / "synthetic" / "fs004" / "volume1")
+
+        ds = DvcDataset.open(path, strict=False)
+
+        assert ds.list_synthetic() == []
+        assert ds.list_broken() == ["fs004"]
+        be = ds.broken_entries["fs004"]
+        assert isinstance(be, BrokenEntry)
+        assert be.kind == "synthetic"
+        assert be.missing == ("volume1",)
+        assert "volume1" in be.reason
+        assert not ds.verification_report.ok
+
+    def test_synthetic_missing_flow(self, make_disk_store: DiskStoreFactory) -> None:
+        path = make_disk_store(profile=PROFILE)
+        shutil.rmtree(path / "synthetic" / "fs004" / "flow")
+
+        ds = DvcDataset.open(path, strict=False)
+
+        assert ds.list_synthetic() == []
+        be = ds.broken_entries["fs004"]
+        assert be.missing == ("flow",)
+
+    def test_synthetic_missing_both(self, make_disk_store: DiskStoreFactory) -> None:
+        path = make_disk_store(profile=PROFILE)
+        shutil.rmtree(path / "synthetic" / "fs004" / "volume1")
+        shutil.rmtree(path / "synthetic" / "fs004" / "flow")
+
+        ds = DvcDataset.open(path, strict=False)
+
+        be = ds.broken_entries["fs004"]
+        assert set(be.missing) == {"volume1", "flow"}
+
+    def test_real_missing_volume1(self, make_disk_store: DiskStoreFactory) -> None:
+        path = make_disk_store(profile=PROFILE)
+        shutil.rmtree(path / "iterations" / "016" / "volume1")
+
+        ds = DvcDataset.open(path, strict=False)
+
+        assert ds.list_real() == []
+        be = ds.broken_entries["016"]
+        assert be.kind == "real"
+        assert be.missing == ("volume1",)
+
+    def test_load_pair_on_broken_name_raises_with_context(
+        self, make_disk_store: DiskStoreFactory
+    ) -> None:
+        path = make_disk_store(profile=PROFILE)
+        shutil.rmtree(path / "synthetic" / "fs004" / "volume1")
+
+        ds = DvcDataset.open(path, strict=False)
+        with pytest.raises(KeyError, match="broken"):
+            ds.load_pair("fs004")
+
+    def test_strict_open_still_raises_on_broken(
+        self, make_disk_store: DiskStoreFactory
+    ) -> None:
+        path = make_disk_store(profile=PROFILE)
+        shutil.rmtree(path / "synthetic" / "fs004" / "volume1")
+        with pytest.raises(StoreVerificationError):
+            DvcDataset.open(path)
+
+    def test_healthy_entries_unaffected_by_broken_sibling(
+        self,
+        make_disk_store: DiskStoreFactory,
+    ) -> None:
+        from tests.io.conftest import _SyntheticEntry
+
+        synthetic = (
+            _SyntheticEntry("fs004", rigid_shift((0.5, 0.0, 0.0))),
+            _SyntheticEntry("fs104", rigid_shift((0.0, 0.5, 0.0))),
+        )
+        path = make_disk_store(profile=PROFILE, synthetic_entries=synthetic)
+        shutil.rmtree(path / "synthetic" / "fs104" / "volume1")
+
+        ds = DvcDataset.open(path, strict=False)
+        # fs004 is still loadable; fs104 is broken.
+        assert ds.list_synthetic() == ["fs004"]
+        assert ds.list_broken() == ["fs104"]
+        pair = ds.load_pair("fs004")
+        assert pair.name == "fs004"
+
+
+class TestMalformedStoreError:
+    """Top-level structural problems raise rather than producing BrokenEntry."""
+
+    def test_missing_synthetic_group_raises(self, make_disk_store: DiskStoreFactory) -> None:
+        path = make_disk_store(profile=PROFILE)
+        shutil.rmtree(path / "synthetic")
+
+        with pytest.raises(MalformedStoreError, match="synthetic"):
+            DvcDataset.open(path, strict=False)
+
+    def test_missing_reference_raises(self, make_disk_store: DiskStoreFactory) -> None:
+        path = make_disk_store(profile=PROFILE)
+        shutil.rmtree(path / "base" / "volume0")
+
+        with pytest.raises(MalformedStoreError, match="volume0"):
+            DvcDataset.open(path, strict=False)

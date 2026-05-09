@@ -36,14 +36,41 @@ from mamba_dvc.types import VoxelSpacing
 
 __all__ = [
     "NO_MASK",
+    "BrokenEntry",
     "DeformationEntry",
     "DvcDataset",
     "EvaluationPair",
+    "MalformedStoreError",
     "NoMaskSentinel",
 ]
 
 
 DeformationKind = Literal["real", "synthetic"]
+
+
+class MalformedStoreError(ValueError):
+    """The store violates a structural invariant required for any rendering.
+
+    Raised for missing top-level groups, missing reference, or a node
+    of the wrong kind (group where an array was required, etc.) — i.e.
+    conditions that ``strict=False`` cannot recover from. Per-entry
+    array problems are reported via :class:`BrokenEntry` instead.
+    """
+
+
+@dataclass(frozen=True)
+class BrokenEntry:
+    """One deformation entry the store has, but the materializer can't bind.
+
+    Surfaced via :attr:`DvcDataset.broken_entries` when
+    ``strict=False`` and a per-entry structural problem is detected
+    (e.g. ``synthetic/fs402`` missing its ``volume1`` array).
+    """
+
+    name: str
+    kind: DeformationKind
+    reason: str
+    missing: tuple[str, ...]
 
 
 class NoMaskSentinel:
@@ -121,6 +148,7 @@ class DvcDataset:
     reference: zarr.Array[Any]
     masks: Mapping[str, zarr.Array[Any]]
     deformations: Mapping[str, DeformationEntry]
+    broken_entries: Mapping[str, BrokenEntry]
     spacing: VoxelSpacing | None
     volume_shape: tuple[int, int, int]
     verification_report: VerificationReport
@@ -134,6 +162,7 @@ class DvcDataset:
         reference: zarr.Array[Any],
         masks: Mapping[str, zarr.Array[Any]],
         deformations: Mapping[str, DeformationEntry],
+        broken_entries: Mapping[str, BrokenEntry],
         spacing: VoxelSpacing | None,
         volume_shape: tuple[int, int, int],
         verification_report: VerificationReport,
@@ -144,6 +173,7 @@ class DvcDataset:
         self.reference = reference
         self.masks = masks
         self.deformations = deformations
+        self.broken_entries = broken_entries
         self.spacing = spacing
         self.volume_shape = volume_shape
         self.verification_report = verification_report
@@ -203,7 +233,7 @@ class DvcDataset:
         )
 
         masks = _resolve_masks(root, profile, manifest)
-        deformations = _resolve_deformations(root, profile, manifest)
+        deformations, broken_entries = _resolve_deformations(root, profile, manifest)
         spacing = manifest.spacing if manifest is not None else None
 
         return cls(
@@ -213,6 +243,7 @@ class DvcDataset:
             reference=reference,
             masks=masks,
             deformations=deformations,
+            broken_entries=broken_entries,
             spacing=spacing,
             volume_shape=volume_shape,
             verification_report=report,
@@ -239,6 +270,10 @@ class DvcDataset:
     def list_masks(self) -> list[str]:
         """Names of available mask arrays, sorted."""
         return sorted(self.masks.keys())
+
+    def list_broken(self) -> list[str]:
+        """Names of entries the store has, but the loader could not bind, sorted."""
+        return sorted(self.broken_entries.keys())
 
     # ------------------------------------------------------ materializers
 
@@ -298,6 +333,9 @@ class DvcDataset:
         KeyError
             If ``deformation`` is unknown.
         """
+        if deformation in self.broken_entries:
+            be = self.broken_entries[deformation]
+            raise KeyError(f"deformation {deformation!r} is broken ({be.kind}): {be.reason}")
         if deformation not in self.deformations:
             raise KeyError(f"unknown deformation: {deformation!r}")
         entry = self.deformations[deformation]
@@ -373,16 +411,41 @@ def _resolve_profile(manifest: StoreManifest | None) -> StoreProfile:
 
 
 def _expect_array(root: zarr.Group, path: str) -> zarr.Array[Any]:
-    node = root[path]
+    """Bind ``root[path]`` as a zarr array or raise ``MalformedStoreError``.
+
+    Used for paths whose absence cannot be tolerated even with
+    ``strict=False`` (e.g. the reference array). Per-entry array
+    failures are routed through :class:`BrokenEntry` instead — see
+    :func:`_try_array`.
+    """
+    try:
+        node = root[path]
+    except KeyError as exc:
+        raise MalformedStoreError(f"missing array at {path!r}") from exc
     if not isinstance(node, zarr.Array):
-        raise TypeError(f"{path}: expected array, got {type(node).__name__}")
+        raise MalformedStoreError(f"{path!r}: expected array, got {type(node).__name__}")
     return node
 
 
 def _expect_group(root: zarr.Group, path: str) -> zarr.Group:
-    node = root[path]
+    """Bind ``root[path]`` as a zarr group or raise ``MalformedStoreError``."""
+    try:
+        node = root[path]
+    except KeyError as exc:
+        raise MalformedStoreError(f"missing group at {path!r}") from exc
     if not isinstance(node, zarr.Group):
-        raise TypeError(f"{path}: expected group, got {type(node).__name__}")
+        raise MalformedStoreError(f"{path!r}: expected group, got {type(node).__name__}")
+    return node
+
+
+def _try_array(parent: zarr.Group, name: str) -> zarr.Array[Any] | None:
+    """Best-effort array bind under ``parent``; ``None`` on missing-or-wrong-kind."""
+    try:
+        node = parent[name]
+    except KeyError:
+        return None
+    if not isinstance(node, zarr.Array):
+        return None
     return node
 
 
@@ -410,8 +473,18 @@ def _resolve_masks(
 
 def _resolve_deformations(
     root: zarr.Group, profile: StoreProfile, manifest: StoreManifest | None
-) -> dict[str, DeformationEntry]:
-    out: dict[str, DeformationEntry] = {}
+) -> tuple[dict[str, DeformationEntry], dict[str, BrokenEntry]]:
+    """Walk the real + synthetic groups, splitting healthy vs broken entries.
+
+    Per-entry array problems (missing ``volume1``, missing ``flow``,
+    or wrong node kind) become :class:`BrokenEntry` records instead
+    of raising. Top-level structural problems (missing ``iterations/``
+    or ``synthetic/`` group) still raise :class:`MalformedStoreError`
+    via :func:`_expect_group`, since no useful rendering is possible.
+    """
+    healthy: dict[str, DeformationEntry] = {}
+    broken: dict[str, BrokenEntry] = {}
+
     real = _expect_group(root, profile.real_group)
     real_discovered = sorted(n for n, node in real.members() if isinstance(node, zarr.Group))
     real_selected = _select_entries(
@@ -419,9 +492,20 @@ def _resolve_deformations(
         discovered=real_discovered,
     )
     for name in real_selected:
-        entry_group = _expect_group(real, name)
-        image = _expect_array(entry_group, profile.deformed_name)
-        out[name] = DeformationEntry(name=name, image=image, flow=None, kind="real")
+        entry_group = real[name]
+        if not isinstance(entry_group, zarr.Group):
+            broken[name] = BrokenEntry(
+                name=name,
+                kind="real",
+                reason=f"expected group, got {type(entry_group).__name__}",
+                missing=(),
+            )
+            continue
+        result = _bind_real_entry(entry_group, name, profile)
+        if isinstance(result, DeformationEntry):
+            healthy[name] = result
+        else:
+            broken[name] = result
 
     synthetic = _expect_group(root, profile.synthetic_group)
     synthetic_discovered = sorted(
@@ -432,12 +516,58 @@ def _resolve_deformations(
         discovered=synthetic_discovered,
     )
     for name in synthetic_selected:
-        entry_group = _expect_group(synthetic, name)
-        image = _expect_array(entry_group, profile.deformed_name)
-        flow = _expect_array(entry_group, profile.flow_name)
-        out[name] = DeformationEntry(name=name, image=image, flow=flow, kind="synthetic")
+        entry_group = synthetic[name]
+        if not isinstance(entry_group, zarr.Group):
+            broken[name] = BrokenEntry(
+                name=name,
+                kind="synthetic",
+                reason=f"expected group, got {type(entry_group).__name__}",
+                missing=(),
+            )
+            continue
+        result = _bind_synthetic_entry(entry_group, name, profile)
+        if isinstance(result, DeformationEntry):
+            healthy[name] = result
+        else:
+            broken[name] = result
 
-    return out
+    return healthy, broken
+
+
+def _bind_real_entry(
+    entry_group: zarr.Group, name: str, profile: StoreProfile
+) -> DeformationEntry | BrokenEntry:
+    image = _try_array(entry_group, profile.deformed_name)
+    if image is None:
+        return BrokenEntry(
+            name=name,
+            kind="real",
+            reason=f"missing {profile.deformed_name!r}",
+            missing=(profile.deformed_name,),
+        )
+    return DeformationEntry(name=name, image=image, flow=None, kind="real")
+
+
+def _bind_synthetic_entry(
+    entry_group: zarr.Group, name: str, profile: StoreProfile
+) -> DeformationEntry | BrokenEntry:
+    image = _try_array(entry_group, profile.deformed_name)
+    flow = _try_array(entry_group, profile.flow_name)
+    missing: list[str] = []
+    if image is None:
+        missing.append(profile.deformed_name)
+    if flow is None:
+        missing.append(profile.flow_name)
+    if missing:
+        names = ", ".join(repr(n) for n in missing)
+        return BrokenEntry(
+            name=name,
+            kind="synthetic",
+            reason=f"missing {names}",
+            missing=tuple(missing),
+        )
+    assert image is not None and flow is not None  # narrowed by checks above
+    return DeformationEntry(name=name, image=image, flow=flow, kind="synthetic")
 
 
 def _select_entries(manifest_entries: Any, discovered: list[str]) -> list[str]:
