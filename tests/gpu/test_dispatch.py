@@ -12,6 +12,7 @@ seam (helper return contract + per-shard scatter).
 from __future__ import annotations
 
 from itertools import pairwise
+from typing import Any
 
 import numpy as np
 import pytest
@@ -152,6 +153,22 @@ class TestCorrelateMultiGpu:
         _assert_fields_match(host_field, gpu_field)
 
     @pytest.mark.slow
+    def test_auto_batch_matches_explicit_batch(self):
+        # Plan §10.1 contract: ``batch_size="auto"`` produces a field
+        # bit-equivalent (within float32 noise) to one produced with an
+        # explicit numeric batch. Batch invariance is the underlying
+        # property -- the pipeline.correlate.TestBatchInvariance test
+        # pins it on the host side; this test pins it through the
+        # auto-batch resolution path on a real device.
+        ref, deformed = self._smooth_pair()
+        kwargs = dict(window=24, overlap=0.5, search_radius=8)
+
+        explicit = correlate_multi_gpu(ref, deformed, device_ids=[0], batch_size=32, **kwargs)
+        auto = correlate_multi_gpu(ref, deformed, device_ids=[0], batch_size="auto", **kwargs)
+
+        _assert_fields_match(explicit, auto)
+
+    @pytest.mark.slow
     def test_multi_process_with_mask_admission(self):
         # Mask admission stratifies POIs into MASKED vs. processed. The
         # parent computes admission once and shards only the admitted
@@ -199,3 +216,195 @@ class TestCorrelateMultiGpuValidation:
         deformed = np.zeros((32, 32, 32), dtype=np.float64)
         with pytest.raises(ValueError, match="float32"):
             correlate_multi_gpu(ref, deformed, device_ids=[0], window=16)  # type: ignore[arg-type]
+
+
+class TestAutoBatchValidation:
+    """Pure validation of the new ``batch_size`` literal contract.
+
+    These run before ``_resolve_device_ids`` -- so no GPU is required
+    and no patching is needed.
+    """
+
+    def test_zero_int_batch_size_raises(self):
+        ref = np.zeros((32, 32, 32), dtype=np.float32)
+        with pytest.raises(ValueError, match="positive int or 'auto'"):
+            correlate_multi_gpu(ref, ref, window=16, batch_size=0)
+
+    def test_unknown_string_batch_size_raises(self):
+        ref = np.zeros((32, 32, 32), dtype=np.float32)
+        with pytest.raises(ValueError, match="positive int or 'auto'"):
+            correlate_multi_gpu(ref, ref, window=16, batch_size="big")  # type: ignore[arg-type]
+
+
+class TestAutoBatchResolution:
+    """``batch_size="auto"`` routes through the budget oracle.
+
+    The dispatch helpers (``_run_single_process`` /
+    ``_run_multi_process``) and the device-id resolver are patched out
+    so the test does not require CUDA. The cold-probe ordering, the
+    structured stderr log, and the BudgetInputs construction are
+    exercised end-to-end on a CPU host.
+    """
+
+    @staticmethod
+    def _stub_run(*args: Any, **_: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        # Single- and multi-process run helpers share the same prefix:
+        # (reference, deformed, eff_mask, eff_def_mask, grid,
+        # admitted_idx, device_id_or_ids, helper_kwargs). We only need
+        # the grid (args[4]) to size the synthetic return.
+        grid = args[4]
+        n = int(np.prod(grid.grid_shape))
+        return (
+            np.zeros((n, 3), dtype=np.float32),
+            np.zeros(n, dtype=np.float32),
+            np.full(n, POIStatus.OK, dtype=np.uint8),
+        )
+
+    def _patch_dispatch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        free_per_device: dict[int, int],
+        captured: dict[str, Any],
+    ) -> None:
+        from mamba_dvc.gpu import dispatch as dispatch_mod
+
+        device_ids = list(free_per_device.keys())
+
+        def fake_probe(d: int) -> tuple[int, int]:
+            return free_per_device[d], 49 * (1024**3)
+
+        def capturing_run(
+            *args: Any, **kwargs: Any
+        ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            captured["helper_kwargs"] = args[-1]
+            return self._stub_run(*args, **kwargs)
+
+        monkeypatch.setattr(dispatch_mod, "_resolve_device_ids", lambda _x: device_ids)
+        monkeypatch.setattr(dispatch_mod, "probe_free_vram", fake_probe)
+        monkeypatch.setattr(dispatch_mod, "_run_single_process", capturing_run)
+        monkeypatch.setattr(dispatch_mod, "_run_multi_process", capturing_run)
+
+    def test_auto_emits_structured_stderr_log(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        captured: dict[str, Any] = {}
+        self._patch_dispatch(
+            monkeypatch,
+            free_per_device={0: 32 * (1024**3), 1: 28 * (1024**3)},
+            captured=captured,
+        )
+
+        rng = np.random.default_rng(42)
+        ref = rng.standard_normal((48, 48, 48), dtype=np.float32)
+        deformed = np.roll(ref, shift=1, axis=0)
+
+        correlate_multi_gpu(ref, deformed, window=24, overlap=0.5, search_radius=8)
+
+        err = capsys.readouterr().err
+        # All seven structured fields must appear -- changing any of
+        # them is a tooling break, not a refactor.
+        for token in (
+            "auto.batch_size=",
+            "auto.free_bytes_min=",
+            "auto.free_bytes_per_device=",
+            "auto.resident_bytes=",
+            "auto.per_poi_bytes=",
+            "auto.fixed_bytes=",
+            "auto.headroom=",
+        ):
+            assert token in err, f"missing token in stderr log: {token!r}\n{err}"
+        # Per-device map carries both ids.
+        assert "0:" in err and "1:" in err
+
+    def test_auto_passes_resolved_int_to_helper(self, monkeypatch: pytest.MonkeyPatch):
+        captured: dict[str, Any] = {}
+        self._patch_dispatch(
+            monkeypatch,
+            free_per_device={0: 40 * (1024**3)},
+            captured=captured,
+        )
+
+        rng = np.random.default_rng(7)
+        ref = rng.standard_normal((48, 48, 48), dtype=np.float32)
+        deformed = np.roll(ref, shift=1, axis=0)
+
+        correlate_multi_gpu(ref, deformed, window=24, overlap=0.5, search_radius=8)
+
+        # The helper sees a resolved int, never the literal "auto".
+        helper_batch = captured["helper_kwargs"]["batch_size"]
+        assert isinstance(helper_batch, int)
+        assert helper_batch > 0
+
+    def test_auto_uses_minimum_free_across_devices(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        # Tight device must dominate. Compare the resolved batch from a
+        # ``[0:32G, 1:8G]`` fleet against a ``[1:8G]`` solo run; they
+        # must match because the cross-device rule is min-of-free.
+        rng = np.random.default_rng(13)
+        ref = rng.standard_normal((48, 48, 48), dtype=np.float32)
+        deformed = np.roll(ref, shift=1, axis=0)
+
+        captured_dual: dict[str, Any] = {}
+        self._patch_dispatch(
+            monkeypatch,
+            free_per_device={0: 32 * (1024**3), 1: 8 * (1024**3)},
+            captured=captured_dual,
+        )
+        correlate_multi_gpu(ref, deformed, window=24, overlap=0.5, search_radius=8)
+        dual_batch = captured_dual["helper_kwargs"]["batch_size"]
+        # Drain the stderr emitted during the first run before the
+        # second so capsys does not conflate the two log lines.
+        capsys.readouterr()
+
+        captured_solo: dict[str, Any] = {}
+        self._patch_dispatch(
+            monkeypatch,
+            free_per_device={1: 8 * (1024**3)},
+            captured=captured_solo,
+        )
+        correlate_multi_gpu(ref, deformed, window=24, overlap=0.5, search_radius=8)
+        solo_batch = captured_solo["helper_kwargs"]["batch_size"]
+
+        assert dual_batch == solo_batch
+
+    def test_explicit_int_skips_resolver_and_log(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        from mamba_dvc.gpu import dispatch as dispatch_mod
+
+        captured: dict[str, Any] = {}
+
+        def capturing_run(
+            *args: Any, **kwargs: Any
+        ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            captured["helper_kwargs"] = args[-1]
+            return self._stub_run(*args, **kwargs)
+
+        monkeypatch.setattr(dispatch_mod, "_resolve_device_ids", lambda _x: [0])
+        monkeypatch.setattr(dispatch_mod, "_run_single_process", capturing_run)
+
+        # Probe must NOT be called for an explicit int batch.
+        def fail_probe(_d: int) -> tuple[int, int]:
+            raise AssertionError("probe_free_vram must not be called for int batch_size")
+
+        monkeypatch.setattr(dispatch_mod, "probe_free_vram", fail_probe)
+
+        rng = np.random.default_rng(91)
+        ref = rng.standard_normal((48, 48, 48), dtype=np.float32)
+        deformed = np.roll(ref, shift=1, axis=0)
+
+        correlate_multi_gpu(
+            ref, deformed, window=24, overlap=0.5, search_radius=8, batch_size=64
+        )
+
+        assert captured["helper_kwargs"]["batch_size"] == 64
+        # No structured log line either.
+        assert "auto." not in capsys.readouterr().err

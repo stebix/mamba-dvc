@@ -58,11 +58,24 @@ __all__ = [
     "BudgetInputs",
     "KernelFootprint",
     "estimate_max_batch",
+    "is_cupy_available",
     "kernel_footprint",
     "probe_free_vram",
     "recommend_batch_size",
     "resident_bytes",
 ]
+
+
+def is_cupy_available() -> bool:
+    """Return ``True`` iff CuPy is importable on this host.
+
+    Provided so callers can gate the ``"auto"`` batch-resolution path
+    without catching :class:`RuntimeError` from :func:`probe_free_vram`
+    (which is also raised on the unrelated underflow path). The single
+    seam for the CuPy-presence check keeps the rest of the package off
+    of the private ``_cp`` symbol.
+    """
+    return _cp is not None
 
 
 # Per-POI coefficient ``c`` such that the FFT kernel's transient

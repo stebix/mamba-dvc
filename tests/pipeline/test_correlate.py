@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 from beartype import beartype
@@ -224,8 +226,13 @@ class TestInputValidation:
 
     def test_non_positive_batch_size_raises(self):
         ref = np.zeros((32, 32, 32), dtype=np.float32)
-        with pytest.raises(ValueError, match="batch_size"):
+        with pytest.raises(ValueError, match="positive int or 'auto'"):
             correlate(ref, ref, window=16, batch_size=0)
+
+    def test_unknown_string_batch_size_raises(self):
+        ref = np.zeros((32, 32, 32), dtype=np.float32)
+        with pytest.raises(ValueError, match="positive int or 'auto'"):
+            correlate(ref, ref, window=16, batch_size="big")  # type: ignore[arg-type]
 
     def test_non_positive_search_radius_raises(self):
         ref = np.zeros((32, 32, 32), dtype=np.float32)
@@ -241,6 +248,131 @@ class TestInputValidation:
         ref = np.zeros((32, 32, 32), dtype=np.float32)
         with pytest.raises(ValueError, match="ncc_normalization"):
             correlate(ref, ref, window=16, ncc_normalization="bogus")  # type: ignore[arg-type]
+
+
+class TestAutoBatch:
+    """``batch_size="auto"`` routes through :mod:`mamba_dvc.gpu.budget`.
+
+    Pure tests -- no GPU required. Each case patches the seam imports
+    on :mod:`mamba_dvc.pipeline.correlate` (the names are bound at
+    module import, so we patch on the importing module, not on
+    ``budget``) and exercises the full ``correlate`` call path. Result
+    correctness is the same as ``TestBatchInvariance`` -- batch size
+    does not affect the field, only memory pressure -- so we lean on
+    that here and assert only the resolution behaviour.
+    """
+
+    @staticmethod
+    def _smooth_pair(
+        shape: tuple[int, int, int] = (32, 32, 32),
+    ) -> tuple[np.ndarray, np.ndarray]:
+        rng = np.random.default_rng(11)
+        ref = rng.standard_normal(shape, dtype=np.float32)
+        return ref, np.roll(ref, shift=1, axis=0)
+
+    def test_auto_calls_recommender_with_resolved_inputs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        from mamba_dvc.pipeline import correlate as correlate_mod
+
+        ref, deformed = self._smooth_pair()
+        captured: dict[str, Any] = {}
+
+        def fake_recommend(inputs: Any, device_ids: Any) -> int:
+            captured["inputs"] = inputs
+            captured["device_ids"] = list(device_ids)
+            return 16
+
+        monkeypatch.setattr(correlate_mod, "is_cupy_available", lambda: True)
+        monkeypatch.setattr(correlate_mod, "recommend_batch_size", fake_recommend)
+
+        field = correlate(ref, deformed, window=16, overlap=0.5, search_radius=4)
+
+        # Recommender saw a single-device probe list -- correlate() has
+        # no device_ids surface, so [0] is the canonical contract.
+        assert captured["device_ids"] == [0]
+        # BudgetInputs reflect the resolved config, not raw user inputs.
+        inputs = captured["inputs"]
+        assert inputs.volume_shape == (32, 32, 32)
+        assert inputs.window == (16, 16, 16)
+        assert inputs.has_mask is False
+        assert inputs.deformed_mask_distinct is False
+        # Result still parses normally.
+        assert isinstance(field, DisplacementField)
+        assert field.displacements.shape[1] == 3
+
+    def test_auto_propagates_mask_flags_to_budget_inputs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        from mamba_dvc.pipeline import correlate as correlate_mod
+
+        ref, deformed = self._smooth_pair()
+        mask = np.ones(ref.shape, dtype=np.bool_)
+        deformed_mask = np.ones(ref.shape, dtype=np.bool_)  # distinct array
+
+        captured: dict[str, Any] = {}
+
+        def fake_recommend(inputs: Any, device_ids: Any) -> int:
+            captured["inputs"] = inputs
+            return 16
+
+        monkeypatch.setattr(correlate_mod, "is_cupy_available", lambda: True)
+        monkeypatch.setattr(correlate_mod, "recommend_batch_size", fake_recommend)
+
+        correlate(
+            ref,
+            deformed,
+            mask,
+            deformed_mask,
+            window=16,
+            overlap=0.5,
+            search_radius=4,
+        )
+
+        assert captured["inputs"].has_mask is True
+        # Distinct deformed_mask array must surface as ``True`` so the
+        # budget charges for the second resident upload.
+        assert captured["inputs"].deformed_mask_distinct is True
+
+    def test_auto_falls_back_to_64_with_warning_when_cupy_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        from mamba_dvc.pipeline import correlate as correlate_mod
+
+        ref, deformed = self._smooth_pair()
+        captured: dict[str, int] = {}
+
+        # Capture the helper's batch_size so we can confirm the
+        # fallback constant landed instead of the still-unresolved
+        # ``"auto"`` literal. Wrap the original helper to keep the
+        # function behaviourally complete.
+        original_helper = correlate_mod.correlate_admitted_subset
+
+        def spy(*args: Any, **kwargs: Any) -> Any:
+            captured["batch_size"] = kwargs["batch_size"]
+            return original_helper(*args, **kwargs)
+
+        monkeypatch.setattr(correlate_mod, "is_cupy_available", lambda: False)
+        monkeypatch.setattr(correlate_mod, "correlate_admitted_subset", spy)
+
+        with pytest.warns(RuntimeWarning, match="auto-batch requires CuPy"):
+            correlate(ref, deformed, window=16, overlap=0.5, search_radius=4)
+
+        assert captured["batch_size"] == 64
+
+    def test_explicit_int_skips_recommender_and_warning(self, monkeypatch: pytest.MonkeyPatch):
+        from mamba_dvc.pipeline import correlate as correlate_mod
+
+        ref, deformed = self._smooth_pair()
+
+        def fail(*_: Any, **__: Any) -> None:
+            raise AssertionError("recommender must not be called for int batch_size")
+
+        monkeypatch.setattr(correlate_mod, "is_cupy_available", lambda: True)
+        monkeypatch.setattr(correlate_mod, "recommend_batch_size", fail)
+
+        # No warning, no recommender call -- the int branch is the gate.
+        correlate(ref, deformed, window=16, overlap=0.5, search_radius=4, batch_size=8)
 
 
 class TestNCCModeKnobs:

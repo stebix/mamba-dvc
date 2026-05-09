@@ -17,6 +17,7 @@ from mamba_dvc.gpu.budget import (
     BudgetInputs,
     KernelFootprint,
     estimate_max_batch,
+    is_cupy_available,
     kernel_footprint,
     probe_free_vram,
     recommend_batch_size,
@@ -330,6 +331,25 @@ class TestRecommendBatchSize:
         monkeypatch.setattr(budget, "_cp", None)
         with pytest.raises(RuntimeError, match="requires CuPy"):
             probe_free_vram(0)
+
+
+class TestIsCupyAvailable:
+    """One-line probe for ``is_cupy_available``.
+
+    Call sites in :mod:`mamba_dvc.pipeline.correlate` use the helper to
+    gate the ``"auto"`` batch fallback without catching
+    :class:`RuntimeError`. The two test cases pin both branches.
+    """
+
+    def test_returns_true_when_cupy_imported(self, monkeypatch: pytest.MonkeyPatch):
+        # Force the "available" branch even if CuPy is missing locally,
+        # so the assertion is deterministic on any CI host.
+        monkeypatch.setattr(budget, "_cp", object())
+        assert is_cupy_available() is True
+
+    def test_returns_false_when_cupy_missing(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(budget, "_cp", None)
+        assert is_cupy_available() is False
 
 
 @pytest.mark.gpu

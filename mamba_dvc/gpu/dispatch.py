@@ -39,18 +39,26 @@ regression-tested.
 from __future__ import annotations
 
 import multiprocessing as mp
+import sys
 import traceback
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import replace
 from multiprocessing.connection import Connection, wait
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from jaxtyping import Bool, Float32
 
 from mamba_dvc.core.grid import build_grid, filter_by_mask
 from mamba_dvc.core.outlier import detect_outliers
+from mamba_dvc.gpu.budget import (
+    BudgetInputs,
+    estimate_max_batch,
+    kernel_footprint,
+    probe_free_vram,
+    resident_bytes,
+)
 from mamba_dvc.gpu.shm import SharedArrayHandle, attach, published
 from mamba_dvc.pipeline._internal import (
     TUKEY_DEFAULTS,
@@ -68,6 +76,13 @@ except ImportError:  # pragma: no cover - exercised on CPU-only machines
     _cp = None  # type: ignore[assignment]
 
 __all__ = ["correlate_multi_gpu"]
+
+
+# Headroom reserved on the free-VRAM pool when ``batch_size="auto"``.
+# Same value the budget module uses by default; pinned here so the
+# resolution log line in :func:`_resolve_auto_batch` cannot drift from
+# the figure passed to :func:`estimate_max_batch`.
+_AUTO_HEADROOM_FRACTION: float = 0.15
 
 
 # Worker -> parent message protocol over a unidirectional Pipe.
@@ -125,6 +140,44 @@ def _shard_admitted_indices(
         in_slab = (z_lat >= z_lo) & (z_lat < z_hi)
         shards.append(admitted_idx[in_slab].astype(np.int64, copy=False))
     return shards
+
+
+def _resolve_auto_batch(
+    inputs: BudgetInputs,
+    device_ids: Sequence[int],
+) -> int:
+    """Probe each device cold, pick a cross-device batch, log the decision.
+
+    Mirrors :func:`mamba_dvc.gpu.budget.recommend_batch_size` but exposes
+    the per-device free-bytes vector so the resolution log is greppable
+    in heterogeneous-fleet debugging. Plan §11.1, Option A: emit a
+    structured ``key=value`` line on stderr rather than churning the
+    return type of :func:`correlate_multi_gpu`.
+
+    The probe must be cold -- run *before* :func:`mamba_dvc.gpu.shm.published`
+    publishes the volumes and *before* any worker spawns. Probing after
+    the upload would undercount available headroom.
+    """
+    free_per_device = [(int(d), int(probe_free_vram(int(d))[0])) for d in device_ids]
+    min_free = min(free for _, free in free_per_device)
+
+    headroom = _AUTO_HEADROOM_FRACTION
+    batch = estimate_max_batch(min_free, inputs, headroom_fraction=headroom)
+
+    fp = kernel_footprint(inputs.window, inputs.mode, inputs.normalization)
+    res = resident_bytes(inputs)
+    per_dev = ",".join(f"{d}:{free}" for d, free in free_per_device)
+    print(
+        f"auto.batch_size={batch} "
+        f"auto.free_bytes_min={min_free} "
+        f"auto.free_bytes_per_device={per_dev} "
+        f"auto.resident_bytes={res} "
+        f"auto.per_poi_bytes={fp.per_poi_bytes} "
+        f"auto.fixed_bytes={fp.fixed_bytes} "
+        f"auto.headroom={headroom}",
+        file=sys.stderr,
+    )
+    return batch
 
 
 def _resolve_device_ids(device_ids: Sequence[int] | None) -> list[int]:
@@ -414,7 +467,7 @@ def correlate_multi_gpu(
     mask_threshold: float = 0.9,
     tukey_alpha: float | None = None,
     search_radius: int | None = None,
-    batch_size: int = 64,
+    batch_size: int | Literal["auto"] = "auto",
     eps: float = 1e-12,
     ncc_mode: NCCMode = NCCMode.LINEAR,
     ncc_normalization: NCCNormalization = NCCNormalization.OVERLAP,
@@ -441,10 +494,13 @@ def correlate_multi_gpu(
     window, overlap, mask_threshold, tukey_alpha, search_radius
         See :func:`correlate`. Identical semantics.
     batch_size
-        Per-shard FFT batch. Defaults to ``64`` because the production
-        kernel (linear + overlap) at ``W=96`` exceeds an A6000's
-        transient budget at the orchestrator's ``256`` default; see
-        plan §6.
+        Per-shard FFT batch. ``"auto"`` (default) probes free VRAM on
+        every device in ``device_ids`` and picks the largest batch that
+        fits the resolved window/mode/normalization config; see
+        :mod:`mamba_dvc.gpu.budget` for the cost model and plan
+        ``docs/plans/batchsize-oracle-v1.md`` for the contract. Pass an
+        integer to bypass the recommender entirely (the existing
+        manual-tuning workflow).
     eps, ncc_mode, ncc_normalization
         See :func:`correlate`.
 
@@ -458,13 +514,17 @@ def correlate_multi_gpu(
     Raises
     ------
     ValueError
-        For malformed inputs (shape, dtype, parameter range) or an
-        empty ``device_ids`` sequence.
+        For malformed inputs (shape, dtype, parameter range), an
+        ``batch_size`` that is neither a positive ``int`` nor the
+        string ``"auto"``, or an empty ``device_ids`` sequence.
     RuntimeError
-        If CuPy is unavailable, if no CUDA device is visible, or if a
-        worker process fails. Worker failures are re-raised on the
-        parent with the offending ``gpu_id`` and the shard size, plus
-        the worker's traceback for diagnosis.
+        If CuPy is unavailable, if no CUDA device is visible, if the
+        ``"auto"`` budget is too tight for the resolved config (the
+        message names ``free``, ``resident``, ``per_poi``, and the
+        offending ``headroom_fraction``), or if a worker process fails.
+        Worker failures are re-raised on the parent with the offending
+        ``gpu_id`` and the shard size, plus the worker's traceback for
+        diagnosis.
 
     Notes
     -----
@@ -486,8 +546,16 @@ def correlate_multi_gpu(
         )
     if reference.ndim != 3:
         raise ValueError(f"reference must be 3D, got ndim={reference.ndim}")
-    if batch_size <= 0:
-        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    # ``Literal["auto"]`` widens batch_size to ``int | str`` at runtime;
+    # split the validation so the int branch keeps the existing
+    # positivity guard and the string branch only accepts "auto".
+    if isinstance(batch_size, int):
+        if batch_size <= 0:
+            raise ValueError(
+                f"batch_size must be a positive int or 'auto', got {batch_size!r}"
+            )
+    elif batch_size != "auto":
+        raise ValueError(f"batch_size must be a positive int or 'auto', got {batch_size!r}")
 
     win = normalize_window(window)
     if search_radius is None:
@@ -539,16 +607,32 @@ def correlate_multi_gpu(
         eff_mask_c if eff_def_mask is eff_mask else np.ascontiguousarray(eff_def_mask)
     )
 
+    resolved_device_ids = _resolve_device_ids(device_ids)
+
+    # Resolve "auto" *after* device_ids are known and *before* any SHM
+    # publish or worker spawn -- the probe must see free VRAM as the
+    # workers will see it. Plan §5.
+    if batch_size == "auto":
+        budget_inputs = BudgetInputs(
+            volume_shape=volume_shape,
+            window=win,
+            mode=ncc_mode,
+            normalization=ncc_normalization,
+            has_mask=mask is not None,
+            deformed_mask_distinct=eff_def_mask_c is not eff_mask_c,
+        )
+        resolved_batch = _resolve_auto_batch(budget_inputs, resolved_device_ids)
+    else:
+        resolved_batch = batch_size
+
     helper_kwargs: dict[str, Any] = {
         "search_radius": search_radius,
-        "batch_size": batch_size,
+        "batch_size": resolved_batch,
         "eps": eps,
         "ncc_mode": ncc_mode,
         "ncc_normalization": ncc_normalization,
         "tukey_alpha": resolved_tukey,
     }
-
-    resolved_device_ids = _resolve_device_ids(device_ids)
 
     if len(resolved_device_ids) == 1:
         displacements, confidence, status = _run_single_process(

@@ -25,11 +25,15 @@ into the parent's full-length buffers.
 
 from __future__ import annotations
 
+import warnings
+from typing import Literal
+
 import numpy as np
 from jaxtyping import Bool, Float32
 
 from mamba_dvc.core.grid import build_grid, filter_by_mask
 from mamba_dvc.core.outlier import detect_outliers
+from mamba_dvc.gpu.budget import BudgetInputs, is_cupy_available, recommend_batch_size
 from mamba_dvc.pipeline._internal import (
     TUKEY_DEFAULTS,
     NCCMode,
@@ -54,7 +58,7 @@ def correlate(
     mask_threshold: float = 0.9,
     tukey_alpha: float | None = None,
     search_radius: int | None = None,
-    batch_size: int = 256,
+    batch_size: int | Literal["auto"] = "auto",
     eps: float = 1e-12,
     ncc_mode: NCCMode = NCCMode.LINEAR,
     ncc_normalization: NCCNormalization = NCCNormalization.OVERLAP,
@@ -98,12 +102,13 @@ def correlate(
         mode.
     batch_size
         Number of POIs processed per FFT batch. Influences peak GPU
-        memory but not the result. The linear kernel allocates
-        ``(batch, 2W, 2W, 2W)`` float32 buffers (~8x the cyclic
-        kernel's transient footprint); at production ``W=96`` expect
-        to drop ``batch_size`` to ~64 to fit on a single A6000. A
-        future helper in :mod:`mamba_dvc.gpu.dispatch` will recommend
-        batch sizes programmatically.
+        memory but not the result. ``"auto"`` (default) probes device
+        ``0`` and asks :mod:`mamba_dvc.gpu.budget` for the largest
+        batch that fits the resolved config; on CPU-only hosts (no
+        CuPy) ``"auto"`` falls back to ``64`` with a
+        :class:`RuntimeWarning`. Pass an integer to bypass the
+        recommender entirely (the function then makes no probe and
+        remains side-effect-free).
     eps
         Safety floor passed through to
         :func:`mamba_dvc.core.ncc.correlate`.
@@ -131,12 +136,21 @@ def correlate(
     ------
     ValueError
         For malformed inputs: shape mismatch, dtype mismatch,
-        host/device mixing, or out-of-range parameters.
+        host/device mixing, ``batch_size`` other than a positive int or
+        ``"auto"``, or out-of-range parameters.
+    RuntimeError
+        If ``batch_size="auto"`` and the resolved per-device budget is
+        too tight for the requested config (the message names ``free``,
+        ``resident``, ``per_poi``, and the offending
+        ``headroom_fraction``).
 
     Notes
     -----
-    The function is pure. v2 multi-GPU dispatch replicates the volumes
-    on each device and calls
+    The function is pure when ``batch_size`` is an explicit integer.
+    ``batch_size="auto"`` performs one cold ``cp.cuda.runtime.memGetInfo``
+    probe via :mod:`mamba_dvc.gpu.budget`; that probe is the only side
+    effect, and it does not allocate or modify device state. v2
+    multi-GPU dispatch replicates the volumes on each device and calls
     :func:`mamba_dvc.pipeline._internal.correlate_admitted_subset`
     once per shard of POIs, sharing the same algorithmic core; v2's
     iterative warp driver calls this function inside a fixed-point
@@ -154,8 +168,16 @@ def correlate(
         )
     if reference.ndim != 3:
         raise ValueError(f"reference must be 3D, got ndim={reference.ndim}")
-    if batch_size <= 0:
-        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    # ``Literal["auto"]`` widens batch_size to ``int | str`` at runtime;
+    # split the validation so the int branch keeps the existing
+    # positivity guard and the string branch only accepts "auto".
+    if isinstance(batch_size, int):
+        if batch_size <= 0:
+            raise ValueError(
+                f"batch_size must be a positive int or 'auto', got {batch_size!r}"
+            )
+    elif batch_size != "auto":
+        raise ValueError(f"batch_size must be a positive int or 'auto', got {batch_size!r}")
 
     win = normalize_window(window)
     if search_radius is None:
@@ -197,6 +219,33 @@ def correlate(
     )
     admitted_idx = np.flatnonzero(admitted).astype(np.int64)
 
+    # Resolve "auto" via :mod:`mamba_dvc.gpu.budget`. Probes device 0
+    # because ``correlate()`` has no device_ids surface; multi-device
+    # callers should use :func:`mamba_dvc.gpu.dispatch.correlate_multi_gpu`,
+    # which probes the actual device set. CPU-only hosts fall back to a
+    # fixed default with a warning so this entrypoint stays usable on
+    # dev machines without CuPy.
+    if batch_size == "auto":
+        if is_cupy_available():
+            budget_inputs = BudgetInputs(
+                volume_shape=volume_shape,
+                window=win,
+                mode=ncc_mode,
+                normalization=ncc_normalization,
+                has_mask=mask is not None,
+                deformed_mask_distinct=effective_def_mask is not effective_mask,
+            )
+            resolved_batch = recommend_batch_size(budget_inputs, [0])
+        else:
+            warnings.warn(
+                "auto-batch requires CuPy; falling back to batch_size=64",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            resolved_batch = 64
+    else:
+        resolved_batch = batch_size
+
     displacements, confidence, status = correlate_admitted_subset(
         reference,
         deformed,
@@ -205,7 +254,7 @@ def correlate(
         grid,
         admitted_idx,
         search_radius=search_radius,
-        batch_size=batch_size,
+        batch_size=resolved_batch,
         eps=eps,
         ncc_mode=ncc_mode,
         ncc_normalization=ncc_normalization,
