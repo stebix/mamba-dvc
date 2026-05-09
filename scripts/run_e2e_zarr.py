@@ -42,6 +42,7 @@ import numpy as np
 import psutil
 import zarr
 from mamba_dvc.core.ncc import NCCMode, NCCNormalization
+from mamba_dvc.gpu.budget import is_cupy_available, probe_free_vram
 from mamba_dvc.gpu.dispatch import correlate_multi_gpu
 from mamba_dvc.io.dataset import NO_MASK, DvcDataset, EvaluationPair
 from mamba_dvc.io.manifest import StoreManifest
@@ -83,6 +84,28 @@ def _parse_dry_shape(spec: str | None) -> tuple[int, int, int] | None:
     return parts  # type: ignore[return-value]
 
 
+def _parse_batch_size(spec: str) -> int | str:
+    """Accept a positive integer or the literal string ``"auto"``.
+
+    Mirrors the contract on
+    :func:`mamba_dvc.gpu.dispatch.correlate_multi_gpu`. ``"auto"`` is
+    forwarded as-is and resolved by the budget oracle inside dispatch.
+    """
+    if spec == "auto":
+        return "auto"
+    try:
+        value = int(spec)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--batch-size must be a positive int or 'auto', got {spec!r}"
+        ) from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError(
+            f"--batch-size must be a positive int or 'auto', got {value}"
+        )
+    return value
+
+
 def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Run mamba-dvc multi-GPU pipeline against a zarr store."
@@ -118,7 +141,17 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--mask-threshold", type=float, default=0.9)
     p.add_argument("--tukey-alpha", type=float, default=None)
     p.add_argument("--search-radius", type=int, default=None)
-    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument(
+        "--batch-size",
+        type=_parse_batch_size,
+        default=64,
+        help=(
+            "FFT batch per shard. Positive int or 'auto' (probes free VRAM and "
+            "asks the budget oracle for the largest fit). Default 64 keeps "
+            "historical numeric reproducibility for one PR cycle; flip to "
+            "'auto' once production runs validate the cost model."
+        ),
+    )
     p.add_argument(
         "--ncc-mode",
         type=NCCMode,
@@ -191,17 +224,14 @@ def phase(name: str, metrics: RunMetrics):
 def _vram_snapshot(device_ids: list[int]) -> list[tuple[int, int, int]]:
     """Return ``(device_id, free_bytes, total_bytes)`` per device.
 
-    No-op (empty list) when CuPy is missing -- the script will fail later
-    in dispatch with a clear error.
+    Delegates to :func:`mamba_dvc.gpu.budget.probe_free_vram` so the
+    script and the budget oracle share one CuPy seam (plan §12).
+    Returns an empty list when CuPy is missing -- the script will fail
+    later in dispatch with a clear error.
     """
-    if _cp is None:
+    if not is_cupy_available():
         return []
-    snap: list[tuple[int, int, int]] = []
-    for d in device_ids:
-        with _cp.cuda.Device(d):
-            free, total = _cp.cuda.runtime.memGetInfo()
-            snap.append((d, int(free), int(total)))
-    return snap
+    return [(d, *probe_free_vram(d)) for d in device_ids]
 
 
 # ---------------------------------------------------------------- reporting
