@@ -1,24 +1,28 @@
 r"""End-to-end driver for the v1 multi-GPU DVC pipeline against a zarr store.
 
-Quick-and-dirty manual perf harness, not part of the test suite. Loads
-reference, deformed, and mask arrays from one (or more) zarr stores,
-materializes them to host NumPy buffers, runs
-:func:`mamba_dvc.gpu.dispatch.correlate_multi_gpu`, and emits a plain-text
-report with phase timings, host-RSS deltas, per-device VRAM deltas, and a
-status / displacement summary.
+Quick-and-dirty manual perf harness, not part of the test suite. Opens a
+:class:`mamba_dvc.io.dataset.DvcDataset`, materializes one
+:class:`EvaluationPair` (reference + deformed + mask + optional GT field),
+runs :func:`mamba_dvc.gpu.dispatch.correlate_multi_gpu`, and emits a
+plain-text report with phase timings, host-RSS deltas, per-device VRAM
+deltas, and a status / displacement summary. When the deformation has a
+ground-truth flow, an :class:`ErrorReport` is appended.
 
 Run with::
 
     uv run python scripts/run_e2e_zarr.py \\
         --store /path/scan.zarr \\
-        --reference-path /t0/raw \\
-        --deformed-path /t1/raw \\
-        --mask-path /screw/mask \\
+        --deformation fs104 \\
         --report report.txt --out displacements.npz
 
 For first runs use ``--dry-run-shape 192,256,256`` to slice a centered
 subblock that finishes in well under a minute. Iterate by re-running with
 different ``--batch-size``.
+
+The new CLI (``--store / --deformation / --mask / --manifest``) replaces
+the legacy ``--reference-path / --deformed-path / --mask-path /
+--mask-store`` triplet from before the profile + manifest contract
+landed.
 """
 
 from __future__ import annotations
@@ -37,8 +41,12 @@ from typing import Any
 import numpy as np
 import psutil
 import zarr
+from mamba_dvc.core.ncc import NCCMode, NCCNormalization
 from mamba_dvc.gpu.dispatch import correlate_multi_gpu
+from mamba_dvc.io.dataset import NO_MASK, DvcDataset, EvaluationPair
+from mamba_dvc.io.manifest import StoreManifest
 from mamba_dvc.types import DisplacementField, POIStatus
+from mamba_dvc.validate.known_fields import ErrorReport, evaluate_pair
 
 try:
     import cupy as _cp  # pyright: ignore[reportMissingImports]
@@ -80,18 +88,24 @@ def _build_argparser() -> argparse.ArgumentParser:
         description="Run mamba-dvc multi-GPU pipeline against a zarr store."
     )
     p.add_argument("--store", required=True, type=Path, help="Path to the zarr store.")
-    p.add_argument("--reference-path", required=True, help="Internal zarr path for reference.")
-    p.add_argument("--deformed-path", required=True, help="Internal zarr path for deformed.")
     p.add_argument(
-        "--mask-store",
-        type=Path,
-        default=None,
-        help="Optional separate zarr store for the mask. Defaults to --store.",
+        "--deformation",
+        required=True,
+        help="Deformation entry name (real iterations/* or synthetic synthetic/*).",
     )
     p.add_argument(
-        "--mask-path",
+        "--mask",
         default=None,
-        help="Internal zarr path for the mask. Omit to run with no mask (all-True).",
+        help=(
+            "Mask name to use. Omit to use the profile / manifest default. "
+            "Pass 'none' to skip the mask entirely."
+        ),
+    )
+    p.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Optional StoreManifest YAML; else discovered from sidecar / .attrs.",
     )
     p.add_argument(
         "--devices",
@@ -105,8 +119,18 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--tukey-alpha", type=float, default=None)
     p.add_argument("--search-radius", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--ncc-mode", choices=("linear", "cyclic"), default="linear")
-    p.add_argument("--ncc-normalization", choices=("overlap", "global"), default="overlap")
+    p.add_argument(
+        "--ncc-mode",
+        type=NCCMode,
+        choices=list(NCCMode),
+        default=NCCMode.LINEAR,
+    )
+    p.add_argument(
+        "--ncc-normalization",
+        type=NCCNormalization,
+        choices=list(NCCNormalization),
+        default=NCCNormalization.OVERLAP,
+    )
     p.add_argument(
         "--dry-run-shape",
         type=_parse_dry_shape,
@@ -159,60 +183,6 @@ def phase(name: str, metrics: RunMetrics):
         dt = time.perf_counter() - t0
         rss_after = int(proc.memory_info().rss)
         metrics.phases.append(PhaseRecord(name, dt, rss_after - rss_before))
-
-
-# --------------------------------------------------------------------- io
-
-
-def _open_zarr_array(store_path: Path, internal_path: str) -> Any:
-    """Open a zarr array via store path + internal path.
-
-    Works for both v3 and v2 stores via the high-level ``zarr.open`` entry
-    point; if the user points at a v3 group, we resolve the internal path.
-    """
-    if not store_path.exists():
-        raise FileNotFoundError(f"zarr store not found: {store_path}")
-    root = zarr.open(str(store_path), mode="r")
-    arr = root[internal_path]
-    return arr
-
-
-def _center_slice(
-    shape: tuple[int, ...], dry: tuple[int, int, int]
-) -> tuple[slice, slice, slice]:
-    """Centered (z,y,x) slice of size ``dry`` inside ``shape``."""
-    out: list[slice] = []
-    for full, want in zip(shape, dry, strict=True):
-        if want > full:
-            raise ValueError(f"--dry-run-shape entry {want} exceeds source shape {full}")
-        lo = (full - want) // 2
-        out.append(slice(lo, lo + want))
-    return tuple(out)  # type: ignore[return-value]
-
-
-def load_volume(
-    store_path: Path,
-    internal_path: str,
-    *,
-    dry_shape: tuple[int, int, int] | None,
-    as_float32: bool,
-) -> np.ndarray:
-    """Materialize a 3D zarr array into a contiguous host buffer."""
-    arr = _open_zarr_array(store_path, internal_path)
-    if arr.ndim != 3:
-        raise ValueError(f"{store_path}:{internal_path} has ndim={arr.ndim}, expected 3")
-    if dry_shape is not None:
-        sl = _center_slice(arr.shape, dry_shape)
-        data = np.asarray(arr[sl])
-    else:
-        data = np.asarray(arr[:])
-    if as_float32:
-        if data.dtype != np.float32:
-            data = data.astype(np.float32, copy=False)
-    else:
-        if data.dtype != np.bool_:
-            data = data.astype(np.bool_, copy=False)
-    return np.ascontiguousarray(data)
 
 
 # --------------------------------------------------------------- vram probe
@@ -311,6 +281,7 @@ def _render_report(
     args: argparse.Namespace,
     metrics: RunMetrics,
     summary: dict[str, Any] | None,
+    error_report: ErrorReport | None,
     error: str | None,
 ) -> str:
     sysinfo = _system_info()
@@ -373,6 +344,24 @@ def _render_report(
                 f"  p50 {stats['conf_p50']:.3f}   p10 {stats['conf_p10']:.3f}   "
                 f"min {stats['conf_min']:.3f}"
             )
+    if error_report is not None:
+        lines.append("")
+        lines.append(f"== error vs ground truth ({error_report.name}) ==")
+        lines.append(
+            f"  mae  {error_report.mae:.4f}   rmse {error_report.rmse:.4f}   "
+            f"p95 {error_report.p95:.4f}"
+        )
+        lines.append(
+            f"  per-axis MAE: dz={error_report.per_axis_mae[0]:.4f} "
+            f"dy={error_report.per_axis_mae[1]:.4f} "
+            f"dx={error_report.per_axis_mae[2]:.4f}"
+        )
+        if error_report.by_distance is not None:
+            tbl = error_report.by_distance
+            lines.append("  by distance from boundary (voxels):")
+            lines.append(f"    edges: {tbl.edges}")
+            lines.append(f"    counts: {tbl.counts.tolist()}")
+            lines.append(f"    mae:    {tbl.mae.tolist()}")
     if error is not None:
         lines.append("")
         lines.append("== ERROR ==")
@@ -384,6 +373,15 @@ def _render_report(
 # --------------------------------------------------------------------- main
 
 
+def _resolve_mask_arg(mask: str | None) -> Any:
+    """Translate the CLI ``--mask`` value into a load_pair selector."""
+    if mask is None:
+        return None
+    if mask.lower() == "none":
+        return NO_MASK
+    return mask
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the harness and return a process exit code (0 = ok, 1 = exception)."""
     args = _build_argparser().parse_args(argv)
@@ -391,40 +389,37 @@ def main(argv: list[str] | None = None) -> int:
     summary: dict[str, Any] | None = None
     error: str | None = None
     field_result: DisplacementField | None = None
-
-    mask_store = args.mask_store if args.mask_store is not None else args.store
+    err_report: ErrorReport | None = None
 
     try:
-        with phase("load_reference", metrics):
-            reference = load_volume(
-                args.store, args.reference_path, dry_shape=args.dry_run_shape, as_float32=True
-            )
-        metrics.inputs["reference"] = {
-            "shape": tuple(reference.shape),
-            "dtype": str(reference.dtype),
-            "nbytes": reference.nbytes,
-        }
+        manifest: StoreManifest | None = None
+        if args.manifest is not None:
+            manifest = StoreManifest.from_yaml(args.manifest)
 
-        with phase("load_deformed", metrics):
-            deformed = load_volume(
-                args.store, args.deformed_path, dry_shape=args.dry_run_shape, as_float32=True
-            )
-        metrics.inputs["deformed"] = {
-            "shape": tuple(deformed.shape),
-            "dtype": str(deformed.dtype),
-            "nbytes": deformed.nbytes,
-        }
+        with phase("open_dataset", metrics):
+            ds = DvcDataset.open(args.store, manifest=manifest)
 
-        mask: np.ndarray | None = None
-        if args.mask_path is not None:
-            with phase("load_mask", metrics):
-                mask = load_volume(
-                    mask_store, args.mask_path, dry_shape=args.dry_run_shape, as_float32=False
-                )
+        with phase("load_pair", metrics):
+            pair: EvaluationPair = ds.load_pair(
+                args.deformation,
+                mask=_resolve_mask_arg(args.mask),
+                dry_shape=args.dry_run_shape,
+            )
+
+        for label, arr in (
+            ("reference", pair.reference),
+            ("deformed", pair.deformed),
+        ):
+            metrics.inputs[label] = {
+                "shape": tuple(arr.shape),
+                "dtype": str(arr.dtype),
+                "nbytes": arr.nbytes,
+            }
+        if pair.mask is not None:
             metrics.inputs["mask"] = {
-                "shape": tuple(mask.shape),
-                "dtype": str(mask.dtype),
-                "nbytes": mask.nbytes,
+                "shape": tuple(pair.mask.shape),
+                "dtype": str(pair.mask.dtype),
+                "nbytes": pair.mask.nbytes,
             }
 
         device_ids_for_probe: list[int] = []
@@ -438,9 +433,9 @@ def main(argv: list[str] | None = None) -> int:
 
         with phase("correlate_multi_gpu", metrics):
             field_result = correlate_multi_gpu(
-                reference,
-                deformed,
-                mask=mask,
+                pair.reference,
+                pair.deformed,
+                mask=pair.mask,
                 device_ids=args.devices,
                 window=args.window,
                 overlap=args.overlap,
@@ -454,6 +449,10 @@ def main(argv: list[str] | None = None) -> int:
 
         metrics.vram_after = _vram_snapshot(device_ids_for_probe)
         summary = _summarize_field(field_result)
+
+        if pair.gt_field is not None:
+            with phase("evaluate_pair", metrics):
+                err_report = evaluate_pair(pair, field_result)
 
         if args.out is not None:
             with phase("serialize", metrics):
@@ -471,7 +470,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         error = traceback.format_exc()
 
-    report = _render_report(args, metrics, summary, error)
+    report = _render_report(args, metrics, summary, err_report, error)
     sys.stdout.write(report)
     if args.report is not None:
         args.report.write_text(report, encoding="utf-8")

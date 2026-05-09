@@ -288,13 +288,19 @@ Each runs in seconds on one GPU; all are CI-eligible.
 
 ### Tier 2 — experimental ground truth (`validate/known_fields.py`)
 
-Load a real `(reference, deformed, mask, gt_field)` tuple from your dataset, run `correlate()`, compute:
+Implemented; see `docs/plans/zarr-interface.md` for the reader + scoring layer
+contract. Open a `DvcDataset`, call `load_pair("fs004")` to get an
+`EvaluationPair`, run `correlate()`, then feed both into
+`validate.known_fields.evaluate_pair(...)` which produces an `ErrorReport`
+with:
 - Per-POI error vector `estimated − ground_truth` (interpolate GT at POI centers).
 - MAE, RMSE, 95th-percentile error overall.
 - Same stats stratified by distance from the screw mask boundary (expect worse near the screw).
 - Confidence-vs-error correlation — sanity check that `confidence` is a useful quality signal.
 
-Not in CI (too big), run manually. Drives the accept/reject decision on the implementation.
+`run_and_evaluate` and `sweep` orchestrate the materialize → correlate → score
+loop end-to-end. Not in CI (too big), run manually; drives the accept/reject
+decision on the implementation.
 
 ## 10. Extensibility hooks (for v2; baked into v1 design)
 

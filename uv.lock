@@ -1138,6 +1138,7 @@ viz = [
 [package.dev-dependencies]
 dev = [
     { name = "pre-commit" },
+    { name = "psutil" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "ruff" },
@@ -1169,6 +1170,7 @@ provides-extras = ["viz"]
 [package.metadata.requires-dev]
 dev = [
     { name = "pre-commit", specifier = ">=4.6.0" },
+    { name = "psutil", specifier = ">=7.0" },
     { name = "pyright", specifier = ">=1.1.409" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "ruff", specifier = ">=0.15.11" },
