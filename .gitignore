@@ -11,3 +11,6 @@ wheels/
 
 # coding agents and LLM stuff
 .claude/scheduled_tasks.lock
+
+# personal scratch notebooks
+notebooks/scratch.ipynb

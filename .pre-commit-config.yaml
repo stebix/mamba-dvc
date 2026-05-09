@@ -27,3 +27,5 @@ repos:
           - scipy>=1.13
           - jaxtyping>=0.3.9
           - beartype>=0.22.9
+          - zarr>=3.0
+          - pyyaml>=6.0

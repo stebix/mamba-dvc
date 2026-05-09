@@ -100,10 +100,14 @@ An optional config switch for `window = 128` exists for tough regions (bigger su
 
 ```
 mamba_dvc/
-  io/
-    volume.py      # reference/deformed readers (zarr v3 / tiff / hdf5)
-    mask.py        # load shared screw mask; validate shape match
-    field.py       # read/write ground-truth flow fields; native format TBD
+  io/                # see docs/plans/zarr-interface.md for the full contract
+    volume.py        # zarr → contiguous host buffer; centered dry_shape
+    mask.py          # bool-coerced mask loader with shape validation
+    field.py         # GroundTruthField: callable wrapper around stored flow
+    profiles.py      # named StoreProfile registry (bone_screw_synchrotron_v1)
+    manifest.py      # optional StoreManifest: per-scan overrides + subsetting
+    verify.py        # structural verifier (dtypes, shapes, axis-order)
+    dataset.py       # DvcDataset.open(...).load_pair(...) → EvaluationPair
   core/
     grid.py        # POI lattice, mask-aware admission
     window.py      # Tukey/Hann, masked mean-subtract, masked zeroing

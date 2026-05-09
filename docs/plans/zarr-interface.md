@@ -20,8 +20,18 @@ structures → evaluation → test surface → deferrals.
 ## 1. Position in the codebase
 
 ```
+   io.profiles.StoreProfile            io.manifest.StoreManifest
+   (registered at import time)         (optional sidecar / .zattrs override)
+              │                                             │
+              └──────────────┬──────────────────────────────┘
+                             ▼
+                    io.manifest.verify(profile, manifest, root)
+                             │
+                             ▼
                     ┌──────────────────────────────────────────────┐
-                    │ DvcDataset.open(path)                        │
+                    │ DvcDataset.open(path, manifest=None)         │
+                    │   - resolves profile (registry / manifest)   │
+                    │   - verifies store against profile+manifest  │
                     │   - lists deformations (real | synthetic)    │
                     │   - exposes lazy zarr.Arrays                 │
                     │   - load_pair(name) → EvaluationPair         │
@@ -63,8 +73,10 @@ at the POI centers.
 | Opening a store reads no voxels | Reference + deformed are 6.3 GB each; opening is interactive. Materialization is per-call and explicit. |
 | Materialization happens at one chokepoint | `io/volume.py::load_volume` is the single host-side materializer. Subblock slicing (`dry_shape`), dtype coerce, and contiguity all live there — once. The current copy in `run_e2e_zarr.py` migrates here verbatim. |
 | Synthetic and experimental GT share one type | `GroundTruthField` is callable with the same signature as `validate.synthetic.DisplacementFunction`. `validate.synthetic.sample_on_grid(field, grid)` works on it unchanged. Test assertions written against synthetic shifts run unmodified against experimental data. |
-| Schema is data, not branching | `StoreLayout` is a small adapter so we can support more than one zarr layout (yours now, future collaborators) without rewriting the dataset. New layouts plug in by registering a layout, not editing `DvcDataset`. |
-| The "real" deformation is a first-class entry | It has `image` but no `field`. `kind="real"` distinguishes it from synthetic entries; `evaluate_pair` raises a clear error if asked to score a real entry without supplying a field externally. |
+| Schema is data, not branching | Layout lives in two cooperating artifacts: a Python-side `StoreProfile` (structural defaults, registered by name) and an optional YAML/zattrs `StoreManifest` (per-store overrides + subsetting). Future collaborators register a new profile; `DvcDataset` is unchanged. |
+| Profile is structural, not enumerative | The profile pins group names (`base / iterations / synthetic`), array names (`volume0 / volume1 / flow`), and invariants (dtypes, spatial-shape match, vector-axis position). It does **not** list per-entry instances — those are discovered from the store and optionally subset by the manifest. |
+| Kind is structural, not attributed | `iterations/<name>` ⇒ real; `synthetic/<name>` ⇒ synthetic. No `kind` attr is read from per-entry `.zattrs`. The first carries `volume1` only; the second carries `volume1` + `flow`. |
+| Verifier is on by default | `DvcDataset.open` runs `verify(profile, manifest, root)` and raises on any error (path missing, dtype mismatch, shape mismatch, missing flow on a synthetic entry). `strict=False` returns the report instead of raising for diagnostic notebooks. |
 | Reader emits no compute | No NCC, no warping, no FFT. Reader output is fungible with hand-loaded NumPy buffers. |
 | Frozen-result discipline carries through | `EvaluationPair`, `ErrorReport`, `BoundaryStratifiedTable` are `frozen=True`. Series-style aggregation builds new objects. |
 | One `EvaluationPair` corresponds to one `correlate()` call | This keeps the interface trivially composable with the timestep `correlate_series` driver — a sweep is a `for name in dataset.list_synthetic()` loop wrapping single-pair calls. |
@@ -84,6 +96,8 @@ import zarr
 from jaxtyping import Bool, Float32
 
 from mamba_dvc.io.field import GroundTruthField
+from mamba_dvc.io.manifest import StoreManifest
+from mamba_dvc.io.profiles import StoreProfile
 from mamba_dvc.types import VoxelSpacing
 
 
@@ -94,16 +108,16 @@ DeformationKind = Literal["real", "synthetic"]
 class DeformationEntry:
     """One deformed-image instance inside a DvcDataset.
 
-    ``field`` is ``None`` for the real experimental deformation
-    (no synthetic ground truth available); present for
-    synthetically-deformed entries.
+    ``flow`` is ``None`` for entries under ``iterations/`` (real
+    experimental deformations, no synthetic ground truth available);
+    present for entries under ``synthetic/``.
     """
 
     name:  str
-    image: zarr.Array                # lazy
-    field: zarr.Array | None         # lazy; None ⇔ kind == "real"
-    kind:  DeformationKind
-    attrs: Mapping[str, Any]         # passthrough .zattrs
+    image: zarr.Array                # lazy; either iterations/<name>/volume1
+                                     # or synthetic/<name>/volume1
+    flow:  zarr.Array | None         # lazy; None ⇔ kind == "real"
+    kind:  DeformationKind           # derived from parent group
 
 
 class DvcDataset:
@@ -115,31 +129,41 @@ class DvcDataset:
     """
 
     reference:    zarr.Array
-    masks:        Mapping[str, zarr.Array]    # at minimum the key "default"
-    deformations: Mapping[str, DeformationEntry]
+    masks:        Mapping[str, zarr.Array]
+    deformations: Mapping[str, DeformationEntry]   # union of real + synthetic
     spacing:      VoxelSpacing | None
     volume_shape: tuple[int, int, int]
-    layout:       "StoreLayout"
+    profile:      StoreProfile
+    manifest:     StoreManifest | None
 
     @classmethod
     def open(
         cls,
         path: Path,
         *,
-        layout: "StoreLayout | None" = None,
+        manifest: StoreManifest | None = None,
+        strict: bool = True,
         mode: Literal["r", "r+"] = "r",
     ) -> "DvcDataset":
-        """Open a zarr store and bind its named entries.
+        """Open a zarr store, resolve its profile, and verify.
 
-        ``layout`` defaults to :class:`DefaultLayout` (§5). Stores
-        produced by other tools can register their own layout and pass
-        it explicitly.
+        ``manifest=None`` triggers sidecar / .zattrs discovery via
+        :meth:`StoreManifest.discover`. The resolved profile comes
+        from the manifest's ``store_format`` field, or — when no
+        manifest exists — from the registry (single registered
+        profile is auto-selected; otherwise the call errors).
+
+        ``strict=True`` (default) raises :class:`StoreVerificationError`
+        on any verifier error. ``strict=False`` returns the dataset
+        anyway and exposes the report on ``self.verification_report``
+        for diagnostic use in notebooks.
         """
 
     # -- listing --------------------------------------------------------
-    def list_all(self)        -> list[str]: ...
+    def list_all(self)        -> list[str]: ...   # union of real + synthetic
     def list_synthetic(self)  -> list[str]: ...
     def list_real(self)       -> list[str]: ...
+    def list_masks(self)      -> list[str]: ...
 
     # -- materializers --------------------------------------------------
     # All accept dry_shape for centered subblocks (mirrors
@@ -150,23 +174,26 @@ class DvcDataset:
 
     def load_mask(
         self,
-        name: str = "default",
+        name: str | None = None,
         *,
         dry_shape: tuple[int, int, int] | None = None,
-    ) -> Bool[np.ndarray, "z y x"]: ...
+    ) -> Bool[np.ndarray, "z y x"]:
+        """Load a mask by name. ``None`` picks the profile's default."""
 
     def load_pair(
         self,
         deformation: str,
         *,
-        mask: str | None = "default",
+        mask: str | None = None,
         dry_shape: tuple[int, int, int] | None = None,
     ) -> "EvaluationPair":
         """Materialize ref + def + mask + GT for a single correlate() call.
 
         ``deformation`` must be a key returned by ``list_all()``.
-        ``mask=None`` skips the mask. ``mask="default"`` (the default)
-        uses the shared screw mask.
+        ``mask=None`` (default) uses the profile's ``default_mask``
+        (``"mask"`` for ``bone_screw_synchrotron_v1``); pass an
+        explicit name (``"mask_fill"``) to override; pass the sentinel
+        ``"none"`` to skip the mask entirely.
         """
 ```
 
@@ -400,19 +427,36 @@ callers pass a dispatcher in if they want to amortize spawn.
 ### Read flow
 
 ```
-DvcDataset.open(path)
-  └── layout.discover(root) → {reference_path, mask_paths,
-                               deformation_entries: [(name, image_path,
-                               field_path | None, kind, attrs)]}
-  └── bind zarr.Array handles (no I/O)
-  └── read .zattrs spacing → VoxelSpacing | None
+DvcDataset.open(path, manifest=None, strict=True)
+  ├── manifest = manifest or StoreManifest.discover(path)        # YAML | .zattrs | None
+  ├── profile  = get_profile(manifest.profile_name)              # or default_profile()
+  ├── root     = zarr.open(path, mode="r")
+  ├── report   = verify(profile, manifest, root)
+  │   └── raise StoreVerificationError(report) if strict and not report.ok
+  ├── discover entries:
+  │     real_names      = sorted(child for child in root[profile.real_group])
+  │     synthetic_names = sorted(child for child in root[profile.synthetic_group])
+  │     mask_names      = sorted(c for c in root[profile.base_group]
+  │                              if c != profile.reference_name)
+  │   then apply manifest subset filters (entries: discover | [...])
+  ├── bind zarr.Array handles (no I/O):
+  │     reference  = root[f"{profile.base_group}/{profile.reference_name}"]
+  │     masks[n]   = root[f"{profile.base_group}/{n}"]            for each name
+  │     entry[n].image = root[f"{group}/{n}/{profile.deformed_name}"]
+  │     entry[n].flow  = root[f"{profile.synthetic_group}/{n}/{profile.flow_name}"]
+  │                      for synthetic only; None for real
+  └── read manifest.spacing → VoxelSpacing | None
 
 DvcDataset.load_pair(name)
-  ├── load_reference()        ─► io.volume.load_volume   (float32)
-  ├── load_mask("default")    ─► io.mask.load_mask       (bool)
-  ├── load_volume(entry.image)─► io.volume.load_volume   (float32)
-  └── if entry.field is not None:
-          GroundTruthField.from_zarr(entry.field, axis_order, convention)
+  ├── load_reference()                      ─► io.volume.load_volume   (float32)
+  ├── load_mask(mask or profile.default_mask)─► io.mask.load_mask      (bool)
+  ├── load_volume(entry.image)              ─► io.volume.load_volume   (float32)
+  └── if entry.flow is not None:
+          flow_spec = manifest.synthetic.flow or profile.flow_defaults
+          GroundTruthField.from_zarr(entry.flow,
+                                     axis_order=flow_spec.axis_order,
+                                     convention=flow_spec.convention,
+                                     dry_shape=dry_shape)
       else:
           gt_field = None
   └── return EvaluationPair(...)
@@ -440,70 +484,229 @@ volume itself and runs on CPU; it is computed lazily inside
 `evaluate_pair` so callers that don't ask for stratified stats don't
 pay for it (passing `distance_bins=()` skips the bin construction).
 
-## 5. Store layouts
+## 5. Store schema — profile + manifest
 
-The reader supports more than one schema via a `StoreLayout` adapter.
-v1 ships one default plus the open-ended hook.
+Store layout is **data, not branching**. Two distinct artifacts cooperate:
 
-### `DefaultLayout` (proposed — pinned by §11 Q1)
+- **Profile** (§5a): Python-side declaration of *structural* schema —
+  group names, array names, default flow metadata, default mask, and
+  invariants. Identified by string name. Registered at import time.
+  One named profile is required.
+- **Manifest** (§5b): optional sidecar (YAML next to the store, or
+  root `.zattrs["dvc_store"]`) carrying *overrides* and *subsetting*
+  on top of a profile. A store that conforms to its profile exactly
+  needs no manifest at all.
 
-```
-scan.zarr/
-  reference                       # (Z, Y, X) float32
-  masks/
-    default                       # (Z, Y, X) bool   (the shared screw mask)
-    [<other>]                     # optional, e.g. per-deformation masks (v2)
-  deformations/
-    real/
-      image                       # (Z, Y, X) float32
-      .zattrs : {"kind": "real"}
-    <synthetic_name>/
-      image                       # (Z, Y, X) float32
-      field                       # (Z, Y, X, 3) float32  (dz, dy, dx)
-      .zattrs : {"kind": "synthetic",
-                 "axis_order": "zyx_3",
-                 "convention": "pull_back",
-                 "units": "voxel"}
-  .zattrs : {"spacing": [sz, sy, sx], "unit": "um"}    # optional
-```
+The verifier (§5c) runs profile + manifest against the actual zarr
+store on `DvcDataset.open` and emits a `VerificationReport`.
 
-Discovery rule: any group under `deformations/` with an `image` array
-becomes an entry. Presence of `field` decides `kind`:
+### 5a. `StoreProfile` and the profile registry
+
+A profile is the *named identity of a layout convention* — the
+collaborator group's "this is how we lay out our zarr stores"
+agreement, encoded once. v1 ships exactly one:
+`bone_screw_synchrotron_v1`, modeled on the rat-bone µCT layout
+in use today.
 
 ```
-kind = "synthetic" if entry has "field" else "real"
+5R_Ti_4w_000.zarr/                    # bone_screw_synchrotron_v1
+  base/
+    volume0                           # (Z, Y, X) float32   reference
+    mask                              # (Z, Y, X) bool      shared screw mask
+    mask_fill                         # (Z, Y, X) bool      filled-screw mask
+    [<other masks>]                   # discoverable
+  iterations/
+    016/
+      volume1                         # (Z, Y, X) float32   real deformed
+    [<other entries>]                 # discoverable
+  synthetic/
+    fs004/
+      volume1                         # (Z, Y, X) float32   synthetic deformed
+      flow                            # (3, Z, Y, X) float32  (dz, dy, dx)
+    [<other entries>]                 # discoverable
 ```
 
-`.zattrs` on the synthetic group disambiguates the axis order /
-convention / units. Missing attrs default to the values written
-above; mismatches raise a clear error rather than silently coercing.
+**Structural rules baked into the profile:**
 
-### `StoreLayout` protocol
+- Top-level groups `base`, `iterations`, `synthetic` (names fixed).
+- `base/volume0` is the reference. (Name fixed.)
+- Each child of `base` other than `volume0` is a mask. Mask names are
+  open; profile declares `default_mask: "mask"`.
+- Each child of `iterations/` is a real-deformation entry; it must
+  contain a `volume1` array.
+- Each child of `synthetic/` is a synthetic-deformation entry; it
+  must contain `volume1` and `flow`.
+- `kind` is **structural**: parent group is `iterations` ⇒ real,
+  parent group is `synthetic` ⇒ synthetic. Never read from a
+  per-entry attribute.
+- Flow defaults: `axis_order="3_zyx"`, `vector_order="dz_dy_dx"`,
+  `convention="pull_back"` (assumed; see §11 Q3 — needs verification
+  against your data; flip via `GroundTruthField(convention=...)`),
+  `units="voxel"`.
+- Volume / mask dtype invariants: `volume0` and `volume1` are
+  `float32`; masks are `bool`; flow is `float32`.
 
 ```python
-class StoreLayout(Protocol):
-    def discover(self, root: zarr.Group) -> "LayoutBindings": ...
+# mamba_dvc/io/profiles.py
 
 @dataclass(frozen=True)
-class LayoutBindings:
-    reference_path:         str
-    mask_paths:             Mapping[str, str]            # name → path
-    deformation_entries:    Sequence["DeformationBinding"]
-    spacing_attr:           VoxelSpacing | None
+class StoreProfile:
+    """Named structural schema for a zarr store."""
 
-@dataclass(frozen=True)
-class DeformationBinding:
-    name:        str
-    image_path:  str
-    field_path:  str | None
-    kind:        DeformationKind
-    axis_order:  FieldAxisOrder | None       # None ⇒ no field
-    convention:  FieldConvention | None
-    attrs:       Mapping[str, Any]
+    name:           str
+    base_group:     str                 # "base"
+    reference_name: str                 # "volume0"
+    default_mask:   str | None          # "mask"
+    real_group:     str                 # "iterations"
+    synthetic_group: str                # "synthetic"
+    deformed_name:  str                 # "volume1"  (in iterations/* and synthetic/*)
+    flow_name:      str                 # "flow"     (in synthetic/* only)
+    flow_defaults:  "FlowSpec"
+    dtype_invariants: "DtypeInvariants"
+
+
+def register_profile(profile: StoreProfile) -> None: ...
+def get_profile(name: str) -> StoreProfile: ...
+def default_profile() -> StoreProfile:
+    """The single registered profile when only one exists; raises otherwise."""
+
+
+# Registered at import time:
+BONE_SCREW_SYNCHROTRON_V1 = StoreProfile(
+    name="bone_screw_synchrotron_v1",
+    base_group="base",
+    reference_name="volume0",
+    default_mask="mask",
+    real_group="iterations",
+    synthetic_group="synthetic",
+    deformed_name="volume1",
+    flow_name="flow",
+    flow_defaults=FlowSpec(
+        axis_order="3_zyx",
+        vector_order="dz_dy_dx",
+        convention="pull_back",      # assumed; see §11 Q3
+        units="voxel",
+    ),
+    dtype_invariants=DtypeInvariants(
+        reference="float32",
+        deformed="float32",
+        mask="bool",
+        flow="float32",
+    ),
+)
+register_profile(BONE_SCREW_SYNCHROTRON_V1)
 ```
 
-A future v2 layout (per-frame masks, time-series stores) plugs in by
-implementing `StoreLayout.discover` — `DvcDataset` is unchanged.
+A second collaborator's layout adds itself with another
+`register_profile(...)` call — no edits to `DvcDataset`, no change
+to the manifest schema.
+
+### 5b. `StoreManifest` (optional sidecar)
+
+When omitted, `DvcDataset.open` resolves the profile from the registry
+(single-profile world: pick the only one; multi-profile: error unless
+the manifest names which to use) and reads the store with profile
+defaults. The manifest only appears when the user needs to:
+
+1. **Disambiguate** in a multi-profile world (`store_format: <name>`).
+2. **Override** flow metadata (e.g. once §11 Q3 is verified and
+   `convention` flips).
+3. **Subset** entries (run a sweep over only some of `synthetic/`).
+4. **Pin** an explicit mask choice as the default.
+
+The sidecar is searched in two locations, in order:
+
+- `<store>.yaml` next to the `.zarr/` directory (sibling sidecar).
+- `<store>.zarr/.zattrs["dvc_store"]` (root group attribute, embedded).
+
+`DvcDataset.open` errors if both exist with conflicting content.
+
+```yaml
+# 5R_Ti_4w_000.zarr.yaml — minimal manifest, all overrides optional.
+dvc_store_version: 1
+store_format: bone_screw_synchrotron_v1     # required when >1 profile registered
+
+# Optional: store-wide spacing. Not in the profile because it varies
+# per scan even within one collaborator's data.
+spacing:
+  values: [1.0, 1.0, 1.0]
+  unit: voxel
+
+# Optional overrides, all keyed by section.
+base:
+  default_mask: mask_fill                   # override profile default
+  masks: discover                           # or explicit subset list
+
+iterations:
+  entries: discover                         # or ["016", "024"]
+
+synthetic:
+  entries: discover                         # or ["fs004", "fs104"]
+  flow:
+    convention: push_forward                # override profile default
+```
+
+```python
+# mamba_dvc/io/manifest.py
+
+@dataclass(frozen=True)
+class StoreManifest:
+    version:       int                                  # == 1 in v1
+    profile_name:  str | None                           # None ⇒ pick from registry
+    spacing:       VoxelSpacing | None
+    base:          "BaseManifest"                       # default_mask override; mask subset
+    iterations:    "EntriesManifest"                    # entries subset
+    synthetic:     "SyntheticManifest"                  # entries subset; flow overrides
+
+    @classmethod
+    def discover(cls, store_path: Path) -> "StoreManifest | None":
+        """Look for sidecar YAML or root .zattrs; return None if neither exists."""
+
+    @classmethod
+    def from_yaml(cls, path: Path) -> "StoreManifest": ...
+    @classmethod
+    def from_zattrs(cls, root: zarr.Group) -> "StoreManifest | None": ...
+
+    def to_yaml(self, path: Path) -> None: ...
+```
+
+### 5c. Verifier
+
+`verify(profile, manifest, root)` walks the merged (profile-defaults +
+manifest-overrides) view and checks every claim against the actual
+zarr store. Emits one `VerificationReport.errors` entry per violation;
+`strict=True` on `DvcDataset.open` raises `StoreVerificationError` on
+the report.
+
+```python
+@dataclass(frozen=True)
+class VerificationReport:
+    ok:       bool
+    errors:   tuple[str, ...]
+    warnings: tuple[str, ...]
+
+
+def verify(
+    profile: StoreProfile,
+    manifest: StoreManifest | None,
+    root: zarr.Group,
+) -> VerificationReport: ...
+```
+
+| Check | Failure example |
+|---|---|
+| Top-level groups exist | `expected group 'base' at store root` |
+| Reference exists with declared dtype | `base/volume0: expected float32, got uint16` |
+| Reference is 3D | `base/volume0: expected ndim=3, got 4` |
+| Each declared mask exists with bool dtype | `base/mask_fill: expected bool, got uint8` |
+| Default mask resolves | `default_mask 'mask' not found under base/` |
+| Every iterations entry has `volume1` | `iterations/016: missing 'volume1'` |
+| Every synthetic entry has `volume1` and `flow` | `synthetic/fs004: missing 'flow'` |
+| Volume spatial shapes match reference | `synthetic/fs104/volume1: shape (960,1280,1280) != reference (960,1280,1281)` |
+| Mask spatial shapes match reference | `base/mask: shape mismatch` |
+| Flow has correct vector axis | `synthetic/fs004/flow: expected leading axis size 3 (axis_order=3_zyx), got 4` |
+| Flow spatial shape matches reference | `synthetic/fs004/flow: spatial shape != reference` |
+| Manifest-listed entries exist on disk | `manifest references synthetic/fs999, not in store` |
 
 ## 6. Migration of `scripts/run_e2e_zarr.py`
 
@@ -512,37 +715,78 @@ Today the script owns:
 - `_center_slice(shape, dry)`                    → moves to `io/volume.py` (private helper)
 - `load_volume(...)`                             → moves to `io/volume.py::load_volume`
 
-Post-migration, the script becomes ~30 lines:
+Post-migration, the script swaps free-form `--reference-path / --deformed-path /
+--mask-path` flags for an entry-name selector:
 
 ```python
-ds   = DvcDataset.open(args.store, layout=DefaultLayout())   # or args-driven
-pair = ds.load_pair(args.deformation, dry_shape=args.dry_run_shape)
+ds   = DvcDataset.open(args.store)                          # profile auto-resolved
+pair = ds.load_pair(
+    args.deformation,                                       # e.g. "fs104" or "016"
+    mask=args.mask,                                         # default: profile default_mask
+    dry_shape=args.dry_run_shape,
+)
 field = correlate_multi_gpu(pair.reference, pair.deformed, mask=pair.mask, ...)
 report = evaluate_pair(pair, field) if pair.gt_field else None
 ```
 
-Back-compat for the old `--reference-path / --deformed-path / --mask-path`
-flags is retained via a `RawPathsLayout` adapter that takes those three
-strings and synthesizes a one-deformation `LayoutBindings`. CI smoke
-runs continue to pass without rewriting their invocation.
+The new CLI shape: `--store <path> --deformation <name> [--mask <name>]
+[--manifest <yaml>]`. The legacy `--reference-path / --deformed-path /
+--mask-path` triplet is **removed**, not deprecated — it predates the
+profile + manifest contract and there is no clean overlap. Existing
+invocations need updating; the script's `--report` / `--out` /
+`--device-ids` / window / batch / NCC flags survive unchanged.
 
 ## 7. Test surface
 
 Pure-CPU, no GPU, no real data:
 
-- `tests/io/test_dataset.py::TestOpenSyntheticStore` —
-  build a tiny in-memory zarr store with `DefaultLayout` shape, open
-  it, assert `list_all() / list_synthetic() / list_real()` return the
-  expected names, and `volume_shape` is right.
-- `tests/io/test_dataset.py::TestLoadPair` — `load_pair("synthetic_X")`
-  yields a fully-populated `EvaluationPair`; `load_pair("real_Y")`
-  yields `gt_field=None`.
-- `tests/io/test_dataset.py::TestDryShape` — centered subblock matches
-  `_center_slice` semantics.
+- `tests/io/test_manifest.py::TestParseMinimal` — minimal sidecar YAML
+  (only `dvc_store_version` + `store_format`) round-trips through
+  `StoreManifest.from_yaml`.
+- `tests/io/test_manifest.py::TestParseFullOverride` — every override
+  field round-trips: spacing, default mask, entries subset, flow
+  override.
+- `tests/io/test_manifest.py::TestUnknownProfileRaises` —
+  `store_format` naming an unregistered profile fails fast.
+- `tests/io/test_profiles.py::TestRegistry` — `register_profile` adds,
+  `get_profile` retrieves, `default_profile()` raises when >1 registered
+  with no manifest.
+- `tests/io/test_verifier.py::TestVerifyHappyPath` — build an in-memory
+  zarr matching `bone_screw_synchrotron_v1`; `verify(...)` returns
+  `ok=True` with no errors.
+- `tests/io/test_verifier.py::TestVerifyShapeMismatch` — synthetic
+  entry's `volume1` has wrong spatial shape; verifier reports a
+  shape-mismatch error.
+- `tests/io/test_verifier.py::TestVerifyMissingFlow` — synthetic entry
+  missing `flow`; verifier flags it; iterations entries with no flow
+  don't trigger the same check.
+- `tests/io/test_verifier.py::TestVerifyDtypeMismatch` — `volume0`
+  written as uint16; verifier reports a dtype-mismatch error.
+- `tests/io/test_verifier.py::TestVerifyFlowAxisOrder` — flow stored
+  as `(Z,Y,X,3)` while profile says `3_zyx`; verifier flags the
+  vector-axis mismatch.
+- `tests/io/test_dataset.py::TestOpenAgainstProfile` — build an
+  in-memory store conforming to `bone_screw_synchrotron_v1` (no
+  manifest); `DvcDataset.open(path)` succeeds and exposes the right
+  entries.
+- `tests/io/test_dataset.py::TestListings` — `list_real()`,
+  `list_synthetic()`, `list_masks()` return the discovered entries.
+- `tests/io/test_dataset.py::TestLoadPairSynthetic` —
+  `load_pair("fs104")` yields a fully-populated `EvaluationPair` with
+  `kind="synthetic"`, `gt_field` callable.
+- `tests/io/test_dataset.py::TestLoadPairReal` —
+  `load_pair("016")` yields `kind="real"`, `gt_field=None`.
+- `tests/io/test_dataset.py::TestLoadPairMaskOverride` — passing
+  `mask="mask_fill"` selects the alternate mask; default picks
+  profile's `default_mask`.
+- `tests/io/test_dataset.py::TestDryShape` — centered subblock semantics
+  preserved across reference, deformed, mask, and flow.
+- `tests/io/test_dataset.py::TestManifestSubset` — sidecar limits
+  `synthetic.entries` to `["fs004"]`; only that entry appears in
+  `list_synthetic()`.
 - `tests/io/test_field.py::TestGroundTruthFieldCallable` —
-  `GroundTruthField(make_pair(...).field_array)` and the analytical
-  `rigid_shift((dz,dy,dx))` agree at POI centers within interpolation
-  tolerance.
+  sampling a stored rigid-shift field at POI centers agrees with
+  `validate.synthetic.rigid_shift` within interpolation tolerance.
 - `tests/io/test_field.py::TestAxisOrderRoundTrip` —
   storing the same field as `(Z,Y,X,3)` and `(3,Z,Y,X)` produces
   equal callables after `from_zarr`.
@@ -599,19 +843,32 @@ test additions called out in §7.
 3. `io/field.py`: `GroundTruthField` class with axis/convention
    adapters. Tests: `TestGroundTruthFieldCallable`,
    `TestAxisOrderRoundTrip`, `TestConventionFlip`.
-4. `io/dataset.py`: `DvcDataset`, `EvaluationPair`,
-   `DeformationEntry`, `DefaultLayout`, `RawPathsLayout`. Tests:
-   `TestOpenSyntheticStore`, `TestLoadPair`.
-5. `validate/known_fields.py`: `ErrorReport`,
+4. `io/profiles.py` + `io/manifest.py`: `StoreProfile`, profile
+   registry, `bone_screw_synchrotron_v1`, `StoreManifest` parser
+   (YAML sidecar + `.zattrs` discovery), `verify` + `VerificationReport`.
+   Adds **PyYAML** as an explicit dependency in `pyproject.toml`.
+   Tests: `TestParseMinimal`, `TestParseFullOverride`,
+   `TestUnknownProfileRaises`, `TestRegistry`,
+   `TestVerifyHappyPath`, `TestVerifyShapeMismatch`,
+   `TestVerifyMissingFlow`, `TestVerifyDtypeMismatch`,
+   `TestVerifyFlowAxisOrder`.
+5. `io/dataset.py`: `DvcDataset`, `EvaluationPair`,
+   `DeformationEntry`. Consumes profile + optional manifest from
+   step 4. Tests: `TestOpenAgainstProfile`, `TestListings`,
+   `TestLoadPairSynthetic`, `TestLoadPairReal`,
+   `TestLoadPairMaskOverride`, `TestDryShape`,
+   `TestManifestSubset`.
+6. `validate/known_fields.py`: `ErrorReport`,
    `BoundaryStratifiedTable`, `evaluate_pair`. Tests:
    `TestEvaluatePairZeroErr`, `TestRealEntryRaises`,
    `TestBoundaryStratification`.
-6. `validate/known_fields.py`: `run_and_evaluate`, `sweep` +
+7. `validate/known_fields.py`: `run_and_evaluate`, `sweep` +
    dispatcher integration. Test:
    `TestSweepReusesDispatcher` (mock).
-7. Rewrite `scripts/run_e2e_zarr.py` on top of `DvcDataset` + keep
-   the `RawPathsLayout` flag set for back-compat.
-8. Update `docs/plans/overview.md` §4 `io/` description to reference
+8. Rewrite `scripts/run_e2e_zarr.py` on top of `DvcDataset` (legacy
+   raw-path flags removed; new `--deformation` / `--mask` /
+   `--manifest` interface).
+9. Update `docs/plans/overview.md` §4 `io/` description to reference
    this doc; mark §9 tier-2 entry as "implemented in
    `validate/known_fields.py`, see `docs/plans/zarr-interface.md`".
 
@@ -621,9 +878,14 @@ test additions called out in §7.
   `DisplacementField` results back into the store is the timestep
   pipeline's `on_pair` writer (see `timestep-pipeline.md` §8), not
   this layer.
-- **No per-frame deformed masks.** `DefaultLayout` allows the
-  `masks/` group to hold more than `default`, but `load_pair` only
-  selects one. v2 per-frame masks are an additive change (overview §10).
+- **No per-frame deformed masks.** Profile allows `base/` to hold
+  more than one mask, but `load_pair` only selects one. v2 per-frame
+  masks are an additive change (overview §10).
+- **No `store init` / `store verify` CLI.** The verifier runs
+  implicitly inside `DvcDataset.open(strict=True)`. A standalone
+  CLI to seed sidecar manifests from an existing store is useful
+  but deferred — once the profile lands, conforming stores need no
+  manifest at all, so there is little to seed.
 - **No tensorstore async.** Open path is synchronous `zarr.open` +
   `arr[:]`. The async reader is a swap-in for `load_volume` when
   needed.
@@ -636,33 +898,40 @@ test additions called out in §7.
   `correlate_series` / `SeriesPairStatus` machinery and is left for
   v2.
 
-## 11. Open questions (blocking — answer before §9 step 4)
+## 11. Resolved schema decisions and remaining open question
 
-These were posed in conversation; landing them here so the eventual
-implementation has a single source of truth.
+### Resolved (baked into `bone_screw_synchrotron_v1`)
 
-1. **Store layout.** Does the proposed `DefaultLayout` (§5) match
-   your existing stores? Specifically:
-   - Are paths `reference`, `masks/default`, `deformations/<name>/image`,
-     `deformations/<name>/field` correct?
-   - Single shared mask, or multiple per store?
-   - Any pre-existing convention from upstream tooling we should adopt
-     instead of inventing?
-2. **Field axis order.** `(Z, Y, X, 3)` last-axis-is-vector (current
-   default), or `(3, Z, Y, X)` channel-first, or `(X, Y, Z, 3)`?
-3. **Field convention.** Pull-back (`deformed(x) = reference(x − u(x))`,
-   matching `validate.synthetic.warp`) or push-forward?
-4. **Field units.** Voxels, or physical units (µm/mm) needing
-   spacing-conversion before comparing against `correlate()` output?
-5. **Real vs synthetic marker.** `kind` attr in `.zattrs`, or
-   "no `field` array present" sufficient?
-6. **Dtype on disk.** Are deformed images already float32, or
-   uint16/int16 needing rescale? Affects `load_volume(as_float32=True)`
-   default behavior.
+| Decision | Value | Source |
+|---|---|---|
+| Top-level grouping | `base / iterations / synthetic` | user-confirmed layout |
+| Reference name | `base/volume0` | structural |
+| Mask names | open under `base/`; default `mask` | structural + profile |
+| Real-vs-synthetic marker | parent group (no per-entry attr) | structural |
+| Real-deformation array name | `iterations/<name>/volume1` | structural |
+| Synthetic-deformation array names | `synthetic/<name>/{volume1, flow}` | structural |
+| Flow axis order | `3_zyx` — `(3, Z, Y, X)` | user-verified |
+| Flow vector order | `dz_dy_dx` | profile assumption |
+| Flow units | `voxel` | user-confirmed; no spacing conversion |
+| `volume0` / `volume1` dtype | `float32` | user-confirmed; no rescale |
+| Mask dtype | `bool` | structural |
+| Flow dtype | `float32` | structural |
 
-The strawman in §5 picks one answer for each so the surrounding
-design is concrete; the answers replace those defaults verbatim once
-the user confirms or redirects.
+### Still open (one item)
+
+**Q3 — flow convention (pull-back vs push-forward).** Status: unknown.
+The profile defaults to `pull_back` (matching
+`validate.synthetic.warp` and the sign convention `correlate()`
+returns) so the assertion `correlate(ref, def).displacements ≈
+gt_field(positions)` works without sign-flipping. **Verification
+plan:** the first end-to-end run on a synthetic entry where the GT
+is a known small rigid shift will reveal the sign — if recovered
+displacements come out as the negative of the stored flow, flip the
+manifest's `synthetic.flow.convention` to `push_forward` and re-run.
+`GroundTruthField` normalizes storage to pull-back at construction,
+so downstream code never branches on convention. Until verified, the
+profile carries `pull_back` plus a `# TODO(verify)` comment in
+`io/profiles.py`.
 
 ## 12. Open questions (non-blocking)
 
