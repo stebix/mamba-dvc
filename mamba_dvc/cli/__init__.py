@@ -23,11 +23,12 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.tree import Tree
 
+from mamba_dvc.cli._budget import budget
 from mamba_dvc.cli._common import resolve_manifest
 from mamba_dvc.io.dataset import BrokenEntry, DvcDataset
 from mamba_dvc.io.verify import VerificationReport
 
-__all__ = ["app", "inspect"]
+__all__ = ["app", "budget", "inspect"]
 
 
 app = typer.Typer(
@@ -47,6 +48,13 @@ def _root() -> None:  # pyright: ignore[reportUnusedFunction]
     subcommand layer (``mamba-dvc inspect <args>``) so additional
     commands slot in without changing the user-facing invocation.
     """
+
+
+# Register subcommands defined in private modules. Splitting them out
+# keeps this file focused on inspect; the registration happens here so
+# every subcommand sits under the same Typer app and shares the root
+# callback above.
+app.command(name="budget")(budget)
 
 
 # --------------------------------------------------------------------- inspect

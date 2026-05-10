@@ -85,6 +85,11 @@ def is_cupy_available() -> bool:
 # workspace fudge). They are intentionally on the high side so a
 # pre-calibration deployment errs toward smaller batches rather than
 # OOM. See the module docstring for the upgrade path.
+# TODO when centred layout lands: the centred-correlation linear kernel
+# flagged in ``docs/plans/overview.md`` §10 has a different padding
+# pattern (no full ``2W`` doubling), so the LINEAR coefficients here will
+# need recomputation -- otherwise ``recommend_batch_size`` will ship a
+# stale model and either OOM or under-utilize.
 _PER_POI_COEFFS: dict[tuple[NCCMode, NCCNormalization], int] = {
     (NCCMode.CYCLIC, NCCNormalization.GLOBAL): 36,
     (NCCMode.LINEAR, NCCNormalization.GLOBAL): 232,
