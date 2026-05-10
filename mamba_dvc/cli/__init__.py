@@ -1,9 +1,10 @@
 """Command-line interface for ``mamba-dvc``.
 
-Currently exposes a single subcommand, :func:`inspect`, that opens a
-zarr store, runs the verifier, and prints a summary of what was
-parsed. Future subcommands (``correlate``, ``sweep``, ...) will live
-alongside it under the same :class:`typer.Typer` app.
+Hosts the :class:`typer.Typer` app and the ``inspect`` subcommand.
+Subcommands that share helpers (manifest discovery, profile loading)
+import them from :mod:`mamba_dvc.cli._common`; subcommands that grow
+into more than a screen of code get their own private module
+(see :mod:`mamba_dvc.cli._budget`).
 
 Entry point: ``[project.scripts] mamba-dvc = "mamba_dvc.cli:app"``.
 """
@@ -11,7 +12,7 @@ Entry point: ``[project.scripts] mamba-dvc = "mamba_dvc.cli:app"``.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -22,9 +23,8 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.tree import Tree
 
+from mamba_dvc.cli._common import resolve_manifest
 from mamba_dvc.io.dataset import BrokenEntry, DvcDataset
-from mamba_dvc.io.manifest import StoreManifest
-from mamba_dvc.io.profiles import get_profile
 from mamba_dvc.io.verify import VerificationReport
 
 __all__ = ["app", "inspect"]
@@ -111,7 +111,7 @@ def inspect(
     manifest, unknown profile name).
     """
     try:
-        manifest_obj, source = _resolve_manifest(
+        manifest_obj, source = resolve_manifest(
             path, manifest_path=manifest, profile_override=profile
         )
     except (KeyError, ValueError) as exc:
@@ -136,63 +136,6 @@ def inspect(
         _render_rich(console, ds, path=path, manifest_source=source, verbose=verbose)
 
     raise typer.Exit(0 if ds.verification_report.ok else 1)
-
-
-# ------------------------------------------------------------- manifest layer
-
-
-def _resolve_manifest(
-    store_path: Path,
-    *,
-    manifest_path: Path | None,
-    profile_override: str | None,
-) -> tuple[StoreManifest | None, str]:
-    """Build the manifest to pass to :meth:`DvcDataset.open`.
-
-    Probes the same sources as :meth:`StoreManifest.discover` but
-    returns a human-readable label naming which one was used (sidecar
-    YAML, embedded ``.zattrs``, explicit ``--manifest`` flag, or
-    ``"none"``). When ``--profile`` is set, an empty manifest is
-    synthesized (or the discovered one updated) to carry the override.
-    """
-    discovered: StoreManifest | None = None
-    base_source = "none"
-
-    if manifest_path is not None:
-        discovered = StoreManifest.from_yaml(manifest_path)
-        base_source = f"--manifest {manifest_path.name}"
-    else:
-        sidecar_path = store_path.with_suffix(store_path.suffix + ".yaml")
-        if sidecar_path.exists():
-            discovered = StoreManifest.from_yaml(sidecar_path)
-            base_source = f"sidecar yaml ({sidecar_path.name})"
-        else:
-            from_attrs = _read_attrs_manifest(store_path)
-            if from_attrs is not None:
-                discovered = from_attrs
-                base_source = "root .zattrs"
-
-    if profile_override is not None:
-        # Surfaces unknown-profile errors before DvcDataset.open runs.
-        get_profile(profile_override)
-        if discovered is None:
-            merged = StoreManifest(profile_name=profile_override)
-        else:
-            merged = replace(discovered, profile_name=profile_override)
-        if base_source == "none":
-            return merged, f"--profile {profile_override}"
-        return merged, f"--profile {profile_override} (over {base_source})"
-
-    return discovered, base_source
-
-
-def _read_attrs_manifest(store_path: Path) -> StoreManifest | None:
-    """Best-effort read of an embedded ``root.attrs['dvc_store']``."""
-    try:
-        root = zarr.open_group(str(store_path), mode="r")
-    except (FileNotFoundError, KeyError, ValueError):  # fmt: skip
-        return None
-    return StoreManifest.from_zattrs(root)
 
 
 # ---------------------------------------------------------------- rendering
