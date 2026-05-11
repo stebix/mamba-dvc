@@ -33,10 +33,10 @@ import sys
 import time
 import traceback
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import numpy as np
 import psutil
@@ -45,9 +45,12 @@ from mamba_dvc.core.ncc import NCCMode, NCCNormalization
 from mamba_dvc.gpu.budget import is_cupy_available, probe_free_vram
 from mamba_dvc.gpu.dispatch import correlate_multi_gpu
 from mamba_dvc.io.dataset import NO_MASK, DvcDataset, EvaluationPair
+from mamba_dvc.io.field import FieldConvention
 from mamba_dvc.io.manifest import StoreManifest
 from mamba_dvc.types import DisplacementField, POIStatus
 from mamba_dvc.validate.known_fields import ErrorReport, evaluate_pair
+
+_FLOW_CONVENTIONS: tuple[str, ...] = get_args(FieldConvention)
 
 try:
     import cupy as _cp  # pyright: ignore[reportMissingImports]
@@ -129,6 +132,18 @@ def _build_argparser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Optional StoreManifest YAML; else discovered from sidecar / .attrs.",
+    )
+    p.add_argument(
+        "--flow-convention",
+        choices=_FLOW_CONVENTIONS,
+        default=None,
+        help=(
+            "Override the synthetic-flow sign convention. Default: defer to "
+            "the manifest / profile (which currently declares 'pull_back', "
+            "though typical zarr stores are actually authored as "
+            "'push_forward'). Pass 'push_forward' here to flip the sign "
+            "interpretation without editing the manifest."
+        ),
     )
     p.add_argument(
         "--devices",
@@ -412,6 +427,24 @@ def _resolve_mask_arg(mask: str | None) -> Any:
     return mask
 
 
+def _apply_flow_convention_override(
+    manifest: StoreManifest | None, convention: str | None
+) -> StoreManifest | None:
+    """Patch ``manifest.synthetic.flow.convention`` from the CLI override.
+
+    Returns ``manifest`` unchanged when no override is requested. When
+    an override is requested but no manifest was loaded, materializes a
+    minimal :class:`StoreManifest` carrying just the flow convention so
+    the dataset's resolution chain (manifest > profile) sees it.
+    """
+    if convention is None:
+        return manifest
+    base = manifest if manifest is not None else StoreManifest()
+    new_flow = replace(base.synthetic.flow, convention=convention)  # type: ignore[arg-type]
+    new_synthetic = replace(base.synthetic, flow=new_flow)
+    return replace(base, synthetic=new_synthetic)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the harness and return a process exit code (0 = ok, 1 = exception)."""
     args = _build_argparser().parse_args(argv)
@@ -425,6 +458,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest: StoreManifest | None = None
         if args.manifest is not None:
             manifest = StoreManifest.from_yaml(args.manifest)
+        manifest = _apply_flow_convention_override(manifest, args.flow_convention)
 
         with phase("open_dataset", metrics):
             ds = DvcDataset.open(args.store, manifest=manifest)
@@ -482,7 +516,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if pair.gt_field is not None:
             with phase("evaluate_pair", metrics):
-                err_report = evaluate_pair(pair, field_result)
+                err_report = evaluate_pair(pair, field_result, distance_bins=())
 
         if args.out is not None:
             with phase("serialize", metrics):

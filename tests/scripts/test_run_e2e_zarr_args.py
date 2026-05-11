@@ -1,8 +1,9 @@
 """Unit tests for ``scripts/run_e2e_zarr.py`` argument parsing.
 
 The script is a manual perf harness, not part of the public API. Only
-the new ``--batch-size`` parser is covered here -- the rest of the
-script is exercised by the manual e2e workflow.
+the new ``--batch-size`` and ``--flow-convention`` switches are
+covered here -- the rest of the script is exercised by the manual e2e
+workflow.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import argparse
 from types import ModuleType
 
 import pytest
+from mamba_dvc.io.manifest import FlowOverride, StoreManifest, SyntheticManifest
 
 
 class TestParseBatchSize:
@@ -72,3 +74,64 @@ class TestArgparserIntegration:
         p = run_e2e_zarr._build_argparser()
         with pytest.raises(SystemExit):
             p.parse_args(["--store", "x", "--deformation", "d", "--batch-size", "big"])
+
+
+class TestFlowConventionFlag:
+    """``--flow-convention`` exposes the synthetic-flow sign convention.
+
+    Default is ``None`` (defer to manifest / profile). When set, it
+    must funnel into ``manifest.synthetic.flow.convention`` so the
+    dataset's ``_flow_convention`` resolution sees it.
+    """
+
+    def test_default_is_none(self, run_e2e_zarr: ModuleType):
+        p = run_e2e_zarr._build_argparser()
+        ns = p.parse_args(["--store", "x", "--deformation", "d"])
+        assert ns.flow_convention is None
+
+    def test_argparser_accepts_push_forward(self, run_e2e_zarr: ModuleType):
+        p = run_e2e_zarr._build_argparser()
+        ns = p.parse_args(
+            ["--store", "x", "--deformation", "d", "--flow-convention", "push_forward"]
+        )
+        assert ns.flow_convention == "push_forward"
+
+    def test_argparser_accepts_pull_back(self, run_e2e_zarr: ModuleType):
+        p = run_e2e_zarr._build_argparser()
+        ns = p.parse_args(
+            ["--store", "x", "--deformation", "d", "--flow-convention", "pull_back"]
+        )
+        assert ns.flow_convention == "pull_back"
+
+    def test_argparser_rejects_unknown(self, run_e2e_zarr: ModuleType):
+        p = run_e2e_zarr._build_argparser()
+        with pytest.raises(SystemExit):
+            p.parse_args(["--store", "x", "--deformation", "d", "--flow-convention", "bogus"])
+
+    def test_override_passthrough_when_none(self, run_e2e_zarr: ModuleType):
+        # No override -> manifest is returned unchanged (identity).
+        m = StoreManifest()
+        out = run_e2e_zarr._apply_flow_convention_override(m, None)
+        assert out is m
+
+    def test_override_none_manifest_none(self, run_e2e_zarr: ModuleType):
+        out = run_e2e_zarr._apply_flow_convention_override(None, None)
+        assert out is None
+
+    def test_override_materializes_manifest_when_absent(self, run_e2e_zarr: ModuleType):
+        out = run_e2e_zarr._apply_flow_convention_override(None, "push_forward")
+        assert isinstance(out, StoreManifest)
+        assert out.synthetic.flow.convention == "push_forward"
+
+    def test_override_patches_existing_manifest(self, run_e2e_zarr: ModuleType):
+        # Carry an unrelated field through to make sure replace() is
+        # surgical and does not stomp on neighbouring overrides.
+        original = StoreManifest(
+            synthetic=SyntheticManifest(
+                flow=FlowOverride(axis_order="3_zyx", convention="pull_back")
+            ),
+        )
+        out = run_e2e_zarr._apply_flow_convention_override(original, "push_forward")
+        assert out is not original  # frozen dataclass -> new instance
+        assert out.synthetic.flow.convention == "push_forward"
+        assert out.synthetic.flow.axis_order == "3_zyx"
