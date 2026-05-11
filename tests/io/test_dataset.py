@@ -136,6 +136,53 @@ class TestLoadPairNoMaskSentinel:
         assert NoMaskSentinel() is NO_MASK
 
 
+class TestLoadSynthetic:
+    def test_image_matches_load_pair_deformed(self, make_disk_store: DiskStoreFactory) -> None:
+        path = make_disk_store(profile=PROFILE)
+        ds = DvcDataset.open(path)
+        image = ds.load_synthetic("fs004", "image")
+        pair = ds.load_pair("fs004")
+        assert image.shape == (8, 16, 16)
+        assert image.dtype == np.float32
+        np.testing.assert_array_equal(image, pair.deformed)
+
+    def test_field_matches_load_pair_gt_field(self, make_disk_store: DiskStoreFactory) -> None:
+        path = make_disk_store(profile=PROFILE)
+        ds = DvcDataset.open(path)
+        field = ds.load_synthetic("fs004", "field")
+        pair = ds.load_pair("fs004")
+        assert isinstance(field, GroundTruthField)
+        assert pair.gt_field is not None
+        coords = np.array([[3.0, 7.0, 7.0]], dtype=np.float32)
+        np.testing.assert_array_equal(field(coords), pair.gt_field(coords))
+
+    def test_unknown_name_raises(self, make_disk_store: DiskStoreFactory) -> None:
+        path = make_disk_store(profile=PROFILE)
+        ds = DvcDataset.open(path)
+        with pytest.raises(KeyError, match="unknown deformation"):
+            ds.load_synthetic("not_an_entry", "image")
+
+    def test_broken_name_raises_with_context(self, make_disk_store: DiskStoreFactory) -> None:
+        path = make_disk_store(profile=PROFILE)
+        shutil.rmtree(path / "synthetic" / "fs004" / "volume1")
+
+        ds = DvcDataset.open(path, strict=False)
+        with pytest.raises(KeyError, match="broken"):
+            ds.load_synthetic("fs004", "image")
+
+    def test_real_entry_rejected(self, make_disk_store: DiskStoreFactory) -> None:
+        path = make_disk_store(profile=PROFILE)
+        ds = DvcDataset.open(path)
+        with pytest.raises(ValueError, match="synthetic-only"):
+            ds.load_synthetic("016", "image")
+
+    def test_invalid_type_raises(self, make_disk_store: DiskStoreFactory) -> None:
+        path = make_disk_store(profile=PROFILE)
+        ds = DvcDataset.open(path)
+        with pytest.raises(ValueError, match="type_ must be"):
+            ds.load_synthetic("fs004", "bogus")  # type: ignore[arg-type]
+
+
 class TestDryShape:
     def test_dry_shape_propagates(self, make_disk_store: DiskStoreFactory) -> None:
         path = make_disk_store(profile=PROFILE)

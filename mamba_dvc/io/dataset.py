@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, overload
 
 import numpy as np
 import zarr
@@ -305,6 +305,63 @@ class DvcDataset:
         if resolved_name not in self.masks:
             raise KeyError(f"unknown mask: {resolved_name!r}")
         return load_mask(self.masks[resolved_name], dry_shape=dry_shape)
+
+    @overload
+    def load_synthetic(
+        self, name: str, type_: Literal["image"]
+    ) -> Float32[np.ndarray, "z y x"]: ...
+
+    @overload
+    def load_synthetic(self, name: str, type_: Literal["field"]) -> GroundTruthField: ...
+
+    def load_synthetic(
+        self,
+        name: str,
+        type_: Literal["image", "field"],
+    ) -> Float32[np.ndarray, "z y x"] | GroundTruthField:
+        """Materialize one component of a synthetic deformation entry.
+
+        Parameters
+        ----------
+        name
+            Name of a synthetic entry from :meth:`list_synthetic`.
+        type_
+            ``"image"`` returns the deformed float32 volume;
+            ``"field"`` returns the ground-truth flow as a
+            :class:`GroundTruthField`.
+
+        Raises
+        ------
+        KeyError
+            If ``name`` is unknown or recorded in
+            :attr:`broken_entries`.
+        ValueError
+            If ``name`` resolves to a real (non-synthetic) entry, or
+            if ``type_`` is not ``"image" | "field"``.
+        """
+        if name in self.broken_entries:
+            be = self.broken_entries[name]
+            raise KeyError(f"deformation {name!r} is broken ({be.kind}): {be.reason}")
+        if name not in self.deformations:
+            raise KeyError(f"unknown deformation: {name!r}")
+
+        entry = self.deformations[name]
+        if entry.kind != "synthetic":
+            raise ValueError(
+                f"{name!r} is a {entry.kind!r} entry; load_synthetic is synthetic-only"
+            )
+        # _bind_synthetic_entry guarantees flow is bound when kind == "synthetic".
+        assert entry.flow is not None
+
+        if type_ == "image":
+            return load_volume(entry.image, as_float32=True)
+        if type_ == "field":
+            return GroundTruthField.from_zarr(
+                entry.flow,
+                axis_order=self._flow_axis_order(),
+                convention=self._flow_convention(),
+            )
+        raise ValueError(f"type_ must be 'image' or 'field', got {type_!r}")
 
     def load_pair(
         self,
