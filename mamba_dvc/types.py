@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -158,6 +159,70 @@ class DisplacementField:
     grid_shape: tuple[int, int, int]
     spacing: tuple[int, int, int]
     window: tuple[int, int, int]
+
+    def save_npz(self, path: Path | str) -> None:
+        """Persist this field to a ``.npz`` archive.
+
+        Writes the per-POI arrays (``positions``, ``displacements``,
+        ``valid``, ``confidence``, ``status``) plus the lattice scalars
+        (``grid_shape``, ``spacing``, ``window``) as small int arrays.
+        The schema matches what ``scripts/run_e2e_zarr.py --out`` emits,
+        so existing notebooks load both. ``numpy.savez`` appends the
+        ``.npz`` suffix if ``path`` lacks it.
+
+        Parameters
+        ----------
+        path
+            Destination path. The parent directory must already exist.
+        """
+        np.savez(
+            path,
+            positions=self.positions,
+            displacements=self.displacements,
+            valid=self.valid,
+            confidence=self.confidence,
+            status=self.status,
+            grid_shape=np.asarray(self.grid_shape, dtype=np.int64),
+            spacing=np.asarray(self.spacing, dtype=np.int64),
+            window=np.asarray(self.window, dtype=np.int64),
+        )
+
+    @classmethod
+    def load_npz(cls, path: Path | str) -> DisplacementField:
+        """Reconstruct a :class:`DisplacementField` from :meth:`save_npz` output.
+
+        Parameters
+        ----------
+        path
+            Path to a ``.npz`` archive written by :meth:`save_npz` (or
+            the equivalent layout from ``scripts/run_e2e_zarr.py``).
+
+        Returns
+        -------
+        DisplacementField
+            The frozen field. Array dtypes are coerced back to the
+            canonical types (float32 / bool / uint8); the lattice
+            scalars are returned as plain ``int`` 3-tuples.
+
+        Raises
+        ------
+        KeyError
+            If the archive is missing one of the expected entries.
+        """
+        with np.load(path) as data:
+            gs = data["grid_shape"]
+            sp = data["spacing"]
+            win = data["window"]
+            return cls(
+                positions=np.ascontiguousarray(data["positions"], dtype=np.float32),
+                displacements=np.ascontiguousarray(data["displacements"], dtype=np.float32),
+                valid=np.ascontiguousarray(data["valid"], dtype=np.bool_),
+                confidence=np.ascontiguousarray(data["confidence"], dtype=np.float32),
+                status=np.ascontiguousarray(data["status"], dtype=np.uint8),
+                grid_shape=(int(gs[0]), int(gs[1]), int(gs[2])),
+                spacing=(int(sp[0]), int(sp[1]), int(sp[2])),
+                window=(int(win[0]), int(win[1]), int(win[2])),
+            )
 
 
 @dataclass(frozen=True)
