@@ -187,6 +187,27 @@ class TestWarp:
         warped = warp_checked(tex, rigid_shift((0.0, 0.0, 0.0)), order=3)
         assert warped.shape == tex.shape
 
+    def test_pull_back_is_default(self):
+        tex = make_texture((20, 20, 20), sigma=1.5, seed=3)
+        field = rigid_shift((1.5, -0.5, 0.25))
+        default = warp(tex, field, order=3)
+        explicit = warp(tex, field, order=3, convention="pull_back")
+        np.testing.assert_array_equal(default, explicit)
+
+    def test_push_forward_equals_pull_back_of_negated_field(self):
+        tex = make_texture((20, 20, 20), sigma=1.5, seed=5)
+        shift = (1.0, -2.0, 0.5)
+        pushed = warp(tex, rigid_shift(shift), order=3, convention="push_forward")
+        # Sign-flip semantics: push_forward(u) ≡ pull_back(-u).
+        flipped = (-shift[0], -shift[1], -shift[2])
+        pulled = warp(tex, rigid_shift(flipped), order=3, convention="pull_back")
+        np.testing.assert_allclose(pushed, pulled, atol=1e-6)
+
+    def test_warp_rejects_unknown_convention(self):
+        tex = make_texture((8, 8, 8), sigma=1.0, seed=0)
+        with pytest.raises(ValueError, match="convention"):
+            warp(tex, rigid_shift((0, 0, 0)), convention="bogus")  # type: ignore[arg-type]
+
 
 class TestSampleOnGrid:
     def test_matches_direct_call(self):

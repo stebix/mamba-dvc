@@ -14,10 +14,18 @@ NumPy; no CuPy.
 
 Warp convention
 ---------------
-All warps use the DIC/DVC **pull-back** forward model:
+The default DIC/DVC convention is **pull-back**:
 ``deformed(x) = reference(x - u(x))``. ``correlate()`` recovers the
 same ``u`` that appears here, so test assertions can compare directly
 without sign-flipping.
+
+:func:`warp` also accepts ``convention="push_forward"``, which samples
+at ``coords + u(x)`` instead. This is a cheap sign-flip — equivalent
+to pull-back of ``-u`` — *not* a true forward scatter. Use it to model
+inputs whose stored field follows the ``deformed(x) = reference(x + u(x))``
+sign convention; remember that any displacement recovered by
+``correlate()`` from such a pair will be the negation of the field
+that produced it.
 
 Coordinate convention
 ---------------------
@@ -31,7 +39,7 @@ than pre-sampled arrays so the ground truth at any POI center is exact
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 import numpy as np
 from jaxtyping import Bool, Float32
@@ -39,9 +47,12 @@ from scipy.ndimage import gaussian_filter, map_coordinates
 
 from mamba_dvc.types import GridSpec
 
+WarpConvention = Literal["pull_back", "push_forward"]
+
 __all__ = [
     "DisplacementFunction",
     "SyntheticPair",
+    "WarpConvention",
     "compose",
     "make_pair",
     "make_texture",
@@ -317,10 +328,21 @@ def warp(
     *,
     order: int = 3,
     mode: str = "reflect",
+    convention: WarpConvention = "pull_back",
 ) -> Float32[np.ndarray, "z y x"]:
     """Warp ``reference`` under ``field`` via cubic spline resampling.
 
-    Implements the pull-back model ``deformed(x) = reference(x - u(x))``.
+    Two sign conventions are supported:
+
+    - ``"pull_back"`` (default): ``deformed(x) = reference(x - u(x))``.
+      This is the DIC/DVC convention used by the rest of the pipeline;
+      ``correlate()`` recovers the same ``u`` that appears here.
+    - ``"push_forward"``: ``deformed(x) = reference(x + u(x))``.
+      Implemented as a sign flip — *not* a true forward scatter. It is
+      equivalent to pull-back of ``-u``. Use this when reproducing
+      inputs whose stored displacement follows the opposite sign
+      convention; the recovered displacement from ``correlate()`` will
+      then be the negation of ``field``.
 
     Parameters
     ----------
@@ -336,6 +358,9 @@ def warp(
         Boundary mode forwarded to ``map_coordinates``. Default
         ``"reflect"``; tests should still exclude a near-boundary band
         when stratifying error.
+    convention
+        ``"pull_back"`` (default) or ``"push_forward"``. See module
+        docstring for the sign-convention discussion.
 
     Returns
     -------
@@ -345,10 +370,15 @@ def warp(
     Raises
     ------
     ValueError
-        If ``reference`` is not 3D.
+        If ``reference`` is not 3D, or ``convention`` is not one of
+        ``"pull_back"`` / ``"push_forward"``.
     """
     if reference.ndim != 3:
         raise ValueError(f"reference must be 3D, got ndim={reference.ndim}")
+    if convention not in ("pull_back", "push_forward"):
+        raise ValueError(
+            f"convention must be 'pull_back' or 'push_forward', got {convention!r}"
+        )
 
     shape = reference.shape
     zz, yy, xx = np.meshgrid(
@@ -360,7 +390,10 @@ def warp(
     coords = np.stack([zz.ravel(), yy.ravel(), xx.ravel()], axis=1)
 
     disp = field(coords)
-    sample_coords = (coords - disp).T  # map_coordinates expects (3, N)
+    # pull_back samples at x - u(x); push_forward sign-flips to x + u(x).
+    # `.T` puts axes first because map_coordinates expects (3, N).
+    signed_disp = -disp if convention == "pull_back" else disp
+    sample_coords = (coords + signed_disp).T
 
     warped = map_coordinates(
         reference,
@@ -395,6 +428,7 @@ def make_pair(
     mask: Bool[np.ndarray, "z y x"] | None = None,
     order: int = 3,
     reference: Float32[np.ndarray, "z y x"] | None = None,
+    convention: WarpConvention = "pull_back",
 ) -> SyntheticPair:
     """Produce a ``(reference, deformed, field, mask)`` bundle.
 
@@ -419,6 +453,8 @@ def make_pair(
         Optional pre-built reference volume (e.g. a phantom from
         :mod:`mamba_dvc.validate.phantoms`). When ``None`` (default),
         ``make_texture`` generates a band-limited noise reference.
+    convention
+        Warp sign convention; see :func:`warp`. Default ``"pull_back"``.
 
     Returns
     -------
@@ -447,7 +483,7 @@ def make_pair(
             raise ValueError(f"reference must be float32, got {reference.dtype}")
         reference_arr = reference
 
-    deformed = warp(reference_arr, field, order=order)
+    deformed = warp(reference_arr, field, order=order, convention=convention)
     return SyntheticPair(
         reference=reference_arr,
         deformed=deformed,
