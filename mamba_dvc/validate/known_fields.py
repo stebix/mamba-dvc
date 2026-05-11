@@ -93,6 +93,7 @@ def evaluate_pair(
     field: DisplacementField,
     *,
     distance_bins: Sequence[float] = (0.0, 5.0, 10.0, 20.0, 50.0),
+    truth: Float32[np.ndarray, "points 3"] | None = None,
 ) -> ErrorReport:
     """Score ``field`` against ``pair.gt_field`` at the field's POIs.
 
@@ -100,8 +101,8 @@ def evaluate_pair(
     ----------
     pair
         Materialized inputs from :meth:`DvcDataset.load_pair`. Must
-        carry a ground-truth field (``pair.gt_field is not None``);
-        otherwise raises.
+        carry a ground-truth field (``pair.gt_field is not None``)
+        unless ``truth`` is supplied directly; otherwise raises.
     field
         Result of running ``correlate()`` / ``correlate_multi_gpu()``
         on ``pair``. POIs marked invalid (``field.valid == False``)
@@ -111,6 +112,14 @@ def evaluate_pair(
         boundary-stratified table. Pass ``()`` to skip the table.
         When ``pair.mask is None``, the table is silently set to
         ``None`` (after a warning) regardless of this argument.
+    truth
+        Optional precomputed ground-truth displacements at
+        ``field.positions``, shape ``(points, 3)``. When given, the
+        internal ``pair.gt_field(field.positions)`` call is skipped —
+        this lets a caller running many parameter variants against one
+        materialized pair (same POI lattice) evaluate the GT field
+        once and reuse it. The caller is responsible for it matching
+        ``field.positions``; only the shape is checked here.
 
     Returns
     -------
@@ -121,15 +130,25 @@ def evaluate_pair(
     Raises
     ------
     ValueError
-        If ``pair.gt_field is None`` (real-deformation entry).
+        If ``pair.gt_field is None`` and ``truth`` is not supplied
+        (real-deformation entry), or if ``truth`` has a shape other
+        than ``field.displacements.shape``.
     """
-    if pair.gt_field is None:
-        raise ValueError(
-            f"pair {pair.name!r} has no ground truth (kind={pair.kind!r}); "
-            f"evaluate_pair requires a synthetic entry"
-        )
+    if truth is None:
+        if pair.gt_field is None:
+            raise ValueError(
+                f"pair {pair.name!r} has no ground truth (kind={pair.kind!r}); "
+                f"evaluate_pair requires a synthetic entry or an explicit truth="
+            )
+        truth = pair.gt_field(field.positions)
+    else:
+        truth = np.ascontiguousarray(truth, dtype=np.float32)
+        if truth.shape != field.displacements.shape:
+            raise ValueError(
+                f"truth shape {truth.shape} does not match "
+                f"field.displacements shape {field.displacements.shape}"
+            )
 
-    truth = pair.gt_field(field.positions)
     err = field.displacements - truth
     valid = field.valid
 

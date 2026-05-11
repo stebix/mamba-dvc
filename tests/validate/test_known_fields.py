@@ -207,6 +207,84 @@ class TestInvalidPOIsExcluded:
         assert report.mae == pytest.approx(0.0, abs=1e-4)
 
 
+class TestEvaluatePairPrecomputedTruth:
+    def test_precomputed_truth_matches_internal_eval(self) -> None:
+        shape = (16, 16, 16)
+        shift = (0.5, -0.25, 1.0)
+        positions = np.array([[5.0, 5.0, 5.0], [10.0, 9.0, 8.0]], dtype=np.float32)
+        displacements = np.array([[0.4, -0.2, 1.1], [0.6, -0.3, 0.9]], dtype=np.float32)
+        mask = np.ones(shape, dtype=np.bool_)
+        pair = _eval_pair(gt_shape=shape, shift=shift, mask=mask)
+        field = _make_field(positions, displacements)
+
+        precomputed = pair.gt_field(field.positions)
+        a = evaluate_pair(pair, field)
+        b = evaluate_pair(pair, field, truth=precomputed)
+        assert b.mae == pytest.approx(a.mae)
+        assert b.rmse == pytest.approx(a.rmse)
+        assert b.p95 == pytest.approx(a.p95)
+        assert b.per_axis_mae == pytest.approx(a.per_axis_mae)
+
+    def test_precomputed_truth_bypasses_gt_field(self) -> None:
+        shape = (8, 8, 8)
+        positions = np.array([[3.0, 3.0, 3.0]], dtype=np.float32)
+        displacements = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
+        mask = np.ones(shape, dtype=np.bool_)
+
+        calls: list[int] = []
+
+        class _CountingField:
+            def __call__(self, coords: np.ndarray) -> np.ndarray:
+                calls.append(len(coords))
+                return np.zeros_like(coords)
+
+        pair = EvaluationPair(
+            reference=np.zeros(shape, dtype=np.float32),
+            deformed=np.zeros(shape, dtype=np.float32),
+            mask=mask,
+            gt_field=_CountingField(),  # type: ignore[arg-type]
+            name="fs004",
+            kind="synthetic",
+            spacing=None,
+        )
+        field = _make_field(positions, displacements)
+        report = evaluate_pair(
+            pair, field, truth=np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
+        )
+        assert report.mae == pytest.approx(0.0, abs=1e-6)
+        assert calls == []  # gt_field was never invoked
+
+    def test_truth_allows_scoring_entry_without_gt_field(self) -> None:
+        shape = (8, 8, 8)
+        positions = np.array([[3.0, 3.0, 3.0]], dtype=np.float32)
+        displacements = np.array([[2.0, 0.0, 0.0]], dtype=np.float32)
+        mask = np.ones(shape, dtype=np.bool_)
+        pair = EvaluationPair(
+            reference=np.zeros(shape, dtype=np.float32),
+            deformed=np.zeros(shape, dtype=np.float32),
+            mask=mask,
+            gt_field=None,
+            name="016",
+            kind="real",
+            spacing=None,
+        )
+        field = _make_field(positions, displacements)
+        report = evaluate_pair(
+            pair, field, truth=np.array([[2.0, 0.0, 0.0]], dtype=np.float32)
+        )
+        assert report.mae == pytest.approx(0.0, abs=1e-6)
+
+    def test_truth_wrong_shape_raises(self) -> None:
+        shape = (8, 8, 8)
+        positions = np.array([[3.0, 3.0, 3.0], [4.0, 4.0, 4.0]], dtype=np.float32)
+        displacements = np.zeros((2, 3), dtype=np.float32)
+        mask = np.ones(shape, dtype=np.bool_)
+        pair = _eval_pair(gt_shape=shape, shift=(0.0, 0.0, 0.0), mask=mask)
+        field = _make_field(positions, displacements)
+        with pytest.raises(ValueError, match="does not match"):
+            evaluate_pair(pair, field, truth=np.zeros((1, 3), dtype=np.float32))
+
+
 # --------------------------------------------------------------------- driver
 
 
