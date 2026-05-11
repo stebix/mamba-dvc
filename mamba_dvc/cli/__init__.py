@@ -25,10 +25,11 @@ from rich.tree import Tree
 
 from mamba_dvc.cli._budget import budget
 from mamba_dvc.cli._common import resolve_manifest
+from mamba_dvc.cli._run import run
 from mamba_dvc.io.dataset import BrokenEntry, DvcDataset
 from mamba_dvc.io.verify import VerificationReport
 
-__all__ = ["app", "budget", "inspect"]
+__all__ = ["app", "budget", "inspect", "run"]
 
 
 app = typer.Typer(
@@ -55,6 +56,7 @@ def _root() -> None:  # pyright: ignore[reportUnusedFunction]
 # every subcommand sits under the same Typer app and shares the root
 # callback above.
 app.command(name="budget")(budget)
+app.command(name="run")(run)
 
 
 # --------------------------------------------------------------------- inspect

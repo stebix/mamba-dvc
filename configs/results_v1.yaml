@@ -1,0 +1,48 @@
+# Batch displacement-field campaign — TEMPLATE.
+#
+# Copy this, point `stores:` at your real .zarr paths, pick the
+# `mask_threshold` sweep (or collapse it once an operating point is
+# chosen), and run:
+#
+#     uv run mamba-dvc run configs/results_v1.yaml --dry-run     # preview
+#     uv run mamba-dvc run configs/results_v1.yaml               # execute
+#
+# Results land under `<out_dir>/<campaign>/`; re-running resumes (only
+# missing variants are recomputed). See docs/plans/run-interface.md.
+
+campaign: results_v1
+
+stores:
+  # Absolute paths to the transduced zarr stores. Replace these.
+  - D:\jannik\synchrotron-data\transduced\103L_Mg5Gd_4w_000.zarr
+
+manifest: null            # optional shared StoreManifest YAML; null → per-store discovery
+
+select:                   # which deformations to run per store
+  real: none              # "all" | "none" | [explicit names] — real entries have no GT
+  synthetic: all
+
+defaults:                 # base correlation params; every variant starts here
+  window: 96
+  overlap: 0.5
+  mask_threshold: 0.9
+  batch_size: auto
+  ncc_mode: linear
+  ncc_normalization: overlap
+  search_radius: null     # null → window // 2
+  tukey_alpha: null       # null → the per-ncc-mode default
+  flow_convention: push_forward   # canonical transduced stores are authored push_forward —
+                                  # do NOT leave this null (the profile default is wrong)
+  mask: null              # null → profile/manifest default; "none" → no mask
+  dry_shape: null         # null → full volume; [z, y, x] → centered subblock for smoke runs
+
+sweep:                    # cartesian product over named axes (each value → a variant)
+  mask_threshold: [0.9, 0.7, 0.5, 0.3]
+  # window: [64, 96]      # uncommenting would make this 4 x 2 = 8 variants
+
+variants: []              # explicit extra points merged onto `defaults`, e.g.:
+  # - { name: hires, window: 128, mask_threshold: 0.3 }
+
+devices: [0, 1, 2, 3]     # GPU ids forwarded to correlate_multi_gpu; null → all visible
+distance_bins: []         # evaluate_pair boundary stratification; [] skips the (slow) EDT
+out_dir: ./results        # campaign dir is <out_dir>/<campaign>/
