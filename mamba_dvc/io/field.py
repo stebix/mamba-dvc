@@ -31,7 +31,7 @@ from typing import Any, Literal
 import numpy as np
 import zarr
 from jaxtyping import Float32
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import map_coordinates, spline_filter
 
 from mamba_dvc.io.volume import center_slice
 
@@ -40,6 +40,12 @@ __all__ = ["FieldAxisOrder", "FieldConvention", "GroundTruthField"]
 
 FieldConvention = Literal["pull_back", "push_forward"]
 FieldAxisOrder = Literal["zyx_3", "3_zyx"]
+
+# Spline orders below this need no prefilter (and ``spline_filter`` rejects
+# them); at and above it the B-spline prefilter is applied once at
+# construction so ``__call__`` doesn't re-run it on every evaluation.
+_PREFILTER_MIN_ORDER = 2
+_BOUNDARY_MODE = "reflect"
 
 
 class GroundTruthField:
@@ -71,10 +77,19 @@ class GroundTruthField:
     convention with ``(dz, dy, dx)`` vector order. Comparisons against
     :attr:`mamba_dvc.types.DisplacementField.displacements` work
     without sign-flipping.
+
+    For ``interpolation >= 2`` the B-spline prefilter is applied once
+    here (per spatial component, with the same ``"reflect"`` boundary
+    mode :meth:`__call__` uses) and ``map_coordinates`` is then called
+    with ``prefilter=False``. ``scipy.ndimage.map_coordinates(...,
+    prefilter=True)`` otherwise re-runs the full-volume recursive
+    filter on every call, which dominates evaluation cost for
+    production-sized flow arrays. The input array is never mutated.
     """
 
     _array: Float32[np.ndarray, "z y x 3"]
     _interpolation: int
+    _prefiltered: bool
 
     def __init__(
         self,
@@ -88,9 +103,28 @@ class GroundTruthField:
         if interpolation < 0 or interpolation > 5:
             raise ValueError(f"interpolation must be in [0, 5], got {interpolation}")
 
-        normalized = np.ascontiguousarray(array, dtype=np.float32)
+        # Own a private contiguous float32 buffer: we negate (push_forward)
+        # and/or prefilter in place below, and must not touch the caller's array.
+        normalized = np.array(array, dtype=np.float32, order="C")
         if convention == "push_forward":
-            normalized = -normalized
+            np.negative(normalized, out=normalized)
+
+        if interpolation >= _PREFILTER_MIN_ORDER:
+            for axis in range(3):
+                # ``output=np.float32`` keeps the prefilter coefficients (and
+                # the transient buffer) in float32, matching what
+                # ``map_coordinates(prefilter=True)`` does internally for a
+                # float32 input. The scipy stub types ``output`` too narrowly
+                # (``type[float64]``); the runtime accepts any dtype.
+                normalized[..., axis] = spline_filter(
+                    normalized[..., axis],
+                    order=interpolation,
+                    output=np.float32,  # pyright: ignore[reportArgumentType]
+                    mode=_BOUNDARY_MODE,
+                )
+            self._prefiltered = True
+        else:
+            self._prefiltered = False
 
         self._array = normalized
         self._interpolation = interpolation
@@ -198,7 +232,7 @@ class GroundTruthField:
                 self._array[..., axis],
                 sample_coords,
                 order=self._interpolation,
-                mode="reflect",
-                prefilter=True,
+                mode=_BOUNDARY_MODE,
+                prefilter=not self._prefiltered,
             ).astype(np.float32, copy=False)
         return out

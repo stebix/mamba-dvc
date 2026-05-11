@@ -7,6 +7,7 @@ import pytest
 import zarr
 from mamba_dvc.io.field import GroundTruthField
 from mamba_dvc.validate.synthetic import rigid_shift
+from scipy.ndimage import map_coordinates
 
 
 def _sample_field_to_array(
@@ -94,6 +95,46 @@ class TestGroundTruthFieldCallable:
     def test_invalid_array_shape_raises(self) -> None:
         with pytest.raises(ValueError, match=r"\(Z, Y, X, 3\)"):
             GroundTruthField(np.zeros((4, 4, 4, 2), dtype=np.float32))
+
+
+class TestPrefilterAtConstruction:
+    def test_evaluation_matches_per_call_prefilter(self) -> None:
+        # The B-spline prefilter is now applied once at construction and
+        # __call__ uses prefilter=False; the result must be identical to
+        # the old behavior (prefilter inside every map_coordinates call).
+        rng = np.random.default_rng(0)
+        shape = (12, 14, 16)
+        sampled = rng.standard_normal((*shape, 3)).astype(np.float32)
+        gtf = GroundTruthField(sampled, convention="pull_back", interpolation=3)
+        coords = rng.uniform(2.0, 9.0, size=(25, 3)).astype(np.float32)
+
+        got = gtf(coords)
+        expected = np.empty_like(coords)
+        for axis in range(3):
+            expected[:, axis] = map_coordinates(
+                sampled[..., axis], coords.T, order=3, mode="reflect", prefilter=True
+            )
+        np.testing.assert_allclose(got, expected, atol=1e-5)
+
+    def test_input_array_not_mutated(self) -> None:
+        sampled = np.arange(6 * 6 * 6 * 3, dtype=np.float32).reshape(6, 6, 6, 3)
+        before = sampled.copy()
+        GroundTruthField(sampled, convention="pull_back", interpolation=3)
+        np.testing.assert_array_equal(sampled, before)
+        GroundTruthField(sampled, convention="push_forward", interpolation=3)
+        np.testing.assert_array_equal(sampled, before)
+
+    def test_cubic_interpolation_prefilters(self) -> None:
+        gtf = GroundTruthField(np.zeros((6, 6, 6, 3), dtype=np.float32), interpolation=3)
+        assert gtf._prefiltered is True
+
+    def test_linear_interpolation_skips_prefilter(self) -> None:
+        sampled = np.zeros((6, 6, 6, 3), dtype=np.float32)
+        sampled[..., 1] = 0.75  # constant dy
+        gtf = GroundTruthField(sampled, convention="pull_back", interpolation=1)
+        assert gtf._prefiltered is False
+        out = gtf(np.array([[2.5, 3.0, 4.0]], dtype=np.float32))
+        np.testing.assert_allclose(out, [[0.0, 0.75, 0.0]], atol=1e-5)
 
 
 class TestAxisOrderRoundTrip:
