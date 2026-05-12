@@ -154,3 +154,47 @@ class TestExecute:
             .splitlines()
         ]
         assert any(r["status"] == "failed" for r in rows)
+
+
+class TestProgressOutput:
+    def test_plain_log_lines_when_stdout_is_not_a_terminal(
+        self,
+        runner: CliRunner,
+        make_disk_store: DiskStoreFactory,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # CliRunner's stdout is not a tty → run picks the plain per-job log
+        # observer (the Rich spinner is for interactive terminals only).
+        monkeypatch.delenv("FORCE_COLOR", raising=False)
+        monkeypatch.setattr("mamba_dvc.run.batch.correlate_multi_gpu", _fake_correlate)
+        store = make_disk_store(profile=BONE_SCREW_SYNCHROTRON_V1, shape=(8, 16, 16))
+        cfg = _write_config(
+            tmp_path / "c.yaml", store, tmp_path / "out", sweep={"mask_threshold": [0.7, 0.5]}
+        )
+        result = runner.invoke(app, ["run", str(cfg), "--no-color"])
+        assert result.exit_code == 0, result.output
+        assert "loading" in result.output
+        assert "1/2" in result.output and "2/2" in result.output
+        assert "run complete" in result.output  # end-of-run summary still printed
+
+    def test_quiet_suppresses_live_progress_but_keeps_summary(
+        self,
+        runner: CliRunner,
+        make_disk_store: DiskStoreFactory,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("FORCE_COLOR", raising=False)
+        monkeypatch.setattr("mamba_dvc.run.batch.correlate_multi_gpu", _fake_correlate)
+        store = make_disk_store(profile=BONE_SCREW_SYNCHROTRON_V1, shape=(8, 16, 16))
+        out_dir = tmp_path / "out"
+        cfg = _write_config(
+            tmp_path / "c.yaml", store, out_dir, sweep={"mask_threshold": [0.7, 0.5]}
+        )
+        result = runner.invoke(app, ["run", str(cfg), "--no-color", "--quiet"])
+        assert result.exit_code == 0, result.output
+        assert "loading" not in result.output
+        assert "1/2" not in result.output
+        assert "run complete" in result.output
+        assert len(list((out_dir / "camp").rglob("*.npz"))) == 2  # results still written

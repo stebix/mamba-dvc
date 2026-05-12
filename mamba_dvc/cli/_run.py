@@ -19,10 +19,20 @@ from typing import Annotated
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 from rich.text import Text
 
-from mamba_dvc.run import BatchSpec, Job, JobResult, plan_jobs, run_batch
+from mamba_dvc.run import BatchSpec, Job, JobResult, NullObserver, plan_jobs, run_batch
 
 __all__ = ["run"]
 
@@ -109,6 +119,14 @@ def run(
             help="Restrict to a subset of stores (by path or .zarr name; repeatable).",
         ),
     ] = None,
+    quiet: Annotated[
+        bool,
+        typer.Option(
+            "--quiet",
+            "-q",
+            help="Suppress the live progress line; still print the end-of-run summary.",
+        ),
+    ] = False,
     no_color: Annotated[
         bool,
         typer.Option("--no-color", help="Disable styled terminal output."),
@@ -143,7 +161,14 @@ def run(
         raise typer.Exit(0)
 
     try:
-        results = run_batch(spec, force=force, only=only_filter, stores=store_subset)
+        results = _execute_campaign(
+            spec,
+            force=force,
+            only=only_filter,
+            stores=store_subset,
+            console=console,
+            quiet=quiet,
+        )
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
@@ -151,6 +176,39 @@ def run(
     _render_results(console, spec, results)
     n_failed = sum(1 for r in results if r.status == "failed")
     raise typer.Exit(1 if n_failed else 0)
+
+
+def _execute_campaign(
+    spec: BatchSpec,
+    *,
+    force: bool,
+    only: dict[str, str] | None,
+    stores: list[Path] | None,
+    console: Console,
+    quiet: bool,
+) -> list[JobResult]:
+    """Run the campaign, picking a progress observer for the output target.
+
+    ``--quiet`` → no live output; a non-terminal stdout (pipe, CI log) →
+    one plain line per finished job; an interactive terminal → a Rich
+    spinner/progress bar. The ``run_batch`` return value and the on-disk
+    artifacts are identical in every case — only the live rendering
+    differs (the library itself stays print-free).
+    """
+    if quiet:
+        return run_batch(spec, force=force, only=only, stores=stores, observer=NullObserver())
+    if not console.is_terminal:
+        return run_batch(
+            spec, force=force, only=only, stores=stores, observer=_PlainLogObserver(console)
+        )
+    with _campaign_progress(console) as progress:
+        return run_batch(
+            spec,
+            force=force,
+            only=only,
+            stores=stores,
+            observer=_RichProgressObserver(progress),
+        )
 
 
 # ----------------------------------------------------------------- rendering
@@ -211,12 +269,8 @@ def _render_results(console: Console, spec: BatchSpec, results: list[JobResult])
     )
 
     for r in results:
-        if r.status != "failed":
-            continue
-        last_line = ((r.error or "").strip().splitlines() or ["(no detail)"])[-1]
-        phase = r.summary.get("phase", "?")
-        loc = f"{r.job.store.name}/{r.job.deformation}/{r.job.variant.variant_id}"
-        console.print(f"[red]FAILED[/red] {loc}  [dim]({phase}: {last_line})[/dim]")
+        if r.status == "failed":
+            console.print(_failure_line(r))
 
 
 def _header_panel(spec: BatchSpec) -> Panel:
@@ -232,3 +286,115 @@ def _header_panel(spec: BatchSpec) -> Panel:
     body.append("devices   ", style="bold")
     body.append("all visible" if spec.devices is None else str(list(spec.devices)))
     return Panel(body, title="campaign", border_style="blue", expand=False)
+
+
+# ----------------------------------------------------------------- progress observers
+
+
+def _loc(job: Job) -> str:
+    """``<store>/<deformation>/<variant_id>`` — the canonical job locator string."""
+    return f"{job.store.name}/{job.deformation}/{job.variant.variant_id}"
+
+
+def _failure_line(result: JobResult) -> str:
+    """Render a one-line ``FAILED <loc> (<phase>: <last traceback line>)`` summary."""
+    phase = result.summary.get("phase", "?")
+    last = ((result.error or "").strip().splitlines() or ["(no detail)"])[-1]
+    return f"[red]FAILED[/red] {_loc(result.job)}  [dim]({phase}: {last})[/dim]"
+
+
+def _campaign_progress(console: Console) -> Progress:
+    """Build the campaign progress bar: spinner, current job, bar, m/n done, elapsed, ETA."""
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
+
+
+class _RichProgressObserver(NullObserver):
+    """Drives one Rich progress task from ``run_batch`` events.
+
+    The owning :class:`~rich.progress.Progress` is started and stopped by
+    its own ``with`` block (see :func:`_execute_campaign`); this observer
+    only adds the task and updates its description/completion. When there
+    is nothing pending it adds no task and stays inert — the end-of-run
+    panel reports the no-op. Inherits the no-op ``on_batch_end`` from
+    :class:`~mamba_dvc.run.NullObserver`.
+    """
+
+    def __init__(self, progress: Progress) -> None:
+        self._progress = progress
+        self._task: TaskID | None = None
+
+    def on_batch_start(self, *, n_jobs: int, n_variants: int) -> None:
+        """Add the progress task sized to the pending-job count (if any)."""
+        if n_jobs:
+            self._task = self._progress.add_task("starting", total=n_jobs)
+
+    def on_pair_load_start(self, store: Path, deformation: str, *, n_variants: int) -> None:
+        """Show the (slow) ``load_pair`` in the description line."""
+        if self._task is not None:
+            self._progress.update(
+                self._task,
+                description=f"[dim]{store.name}/{deformation}[/dim]  loading pair",
+            )
+
+    def on_job_start(self, job: Job) -> None:
+        """Switch the description to the in-flight variant."""
+        if self._task is not None:
+            self._progress.update(
+                self._task,
+                description=(
+                    f"[dim]{job.store.name}/{job.deformation}[/dim]  "
+                    f"[cyan]{job.variant.name}[/cyan]  correlating"
+                ),
+            )
+
+    def on_job_end(self, result: JobResult) -> None:
+        """Advance the bar; print a line above it when the job failed."""
+        if self._task is None:
+            return
+        self._progress.advance(self._task)
+        if result.status == "failed":
+            self._progress.console.print(_failure_line(result))
+
+
+class _PlainLogObserver(NullObserver):
+    """Emits one plain line per finished job — for non-terminal stdout (pipes, CI).
+
+    No spinner or cursor control: just append-only ``done/total`` lines so
+    a redirected log stays readable. Inherits the no-op ``on_job_start`` /
+    ``on_batch_end`` from :class:`~mamba_dvc.run.NullObserver`.
+    """
+
+    def __init__(self, console: Console) -> None:
+        self._console = console
+        self._done = 0
+        self._total = 0
+
+    def on_batch_start(self, *, n_jobs: int, n_variants: int) -> None:
+        """Record the job total used in the per-job ``done/total`` prefix."""
+        self._total = n_jobs
+
+    def on_pair_load_start(self, store: Path, deformation: str, *, n_variants: int) -> None:
+        """Note the start of a (slow) ``load_pair``."""
+        self._console.print(
+            f"[dim]loading[/dim]  {store.name}/{deformation}  ({n_variants} variant(s))"
+        )
+
+    def on_job_end(self, result: JobResult) -> None:
+        """Print a one-line ``done/total  status  locator`` entry."""
+        self._done += 1
+        prefix = f"  {self._done}/{self._total}"
+        if result.status == "failed":
+            self._console.print(f"{prefix}  {_failure_line(result)}")
+        else:
+            secs = result.summary.get("wall_correlate_s", 0.0)
+            self._console.print(
+                f"{prefix}  [green]ok[/green]  {_loc(result.job)}  [dim]{secs}s[/dim]"
+            )
