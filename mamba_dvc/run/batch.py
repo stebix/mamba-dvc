@@ -429,12 +429,12 @@ def _make_default_opener(spec: BatchSpec) -> DatasetOpener:
 
     def _open(store: Path, flow_convention: str | None) -> DvcDataset:
         if flow_convention is None:
-            return DvcDataset.open(store, manifest=shared_manifest)
+            return DvcDataset.open(store, manifest=shared_manifest, strict=spec.strict)
         base = (
             shared_manifest if shared_manifest is not None else StoreManifest.discover(store)
         )
         patched = _apply_flow_convention(base, flow_convention)
-        return DvcDataset.open(store, manifest=patched)
+        return DvcDataset.open(store, manifest=patched, strict=spec.strict)
 
     return _open
 

@@ -98,6 +98,7 @@ _KNOWN_TOP_KEYS: frozenset[str] = frozenset(
         "campaign",
         "stores",
         "manifest",
+        "strict",
         "select",
         "defaults",
         "sweep",
@@ -178,6 +179,13 @@ class BatchSpec:
         Optional shared :class:`~mamba_dvc.io.manifest.StoreManifest`
         YAML applied to every store. ``None`` falls back to per-store
         discovery (sidecar YAML / embedded ``.zattrs``).
+    strict
+        Passed through to :meth:`DvcDataset.open`. ``True`` (the default)
+        aborts on a store that fails verification; ``False`` opens it
+        anyway and processes only its healthy entries (the broken ones
+        land in ``broken_entries`` and drop out of ``list_*``). Set it
+        ``False`` when a store has a known-bad sub-entry you want to skip
+        rather than lose the whole store over.
     select_real, select_synthetic
         Which deformation entries to run per store: ``"all"``,
         ``"none"``, or an explicit tuple of names. Real entries have no
@@ -205,6 +213,7 @@ class BatchSpec:
     campaign: str
     stores: tuple[Path, ...]
     manifest: Path | None
+    strict: bool
     select_real: SelectSpec
     select_synthetic: SelectSpec
     variants: tuple[Variant, ...]
@@ -271,6 +280,11 @@ class BatchSpec:
         manifest_raw = raw.get("manifest")
         manifest = Path(str(manifest_raw)) if manifest_raw is not None else None
 
+        strict_raw = raw.get("strict", True)
+        if not isinstance(strict_raw, bool):
+            raise ValueError(f"campaign config 'strict' must be a bool, got {strict_raw!r}")
+        strict = strict_raw
+
         select_raw = raw.get("select", {})
         if not isinstance(select_raw, Mapping):
             raise ValueError("campaign config 'select' must be a mapping")
@@ -297,6 +311,7 @@ class BatchSpec:
             campaign=campaign,
             stores=stores,
             manifest=manifest,
+            strict=strict,
             select_real=select_real,
             select_synthetic=select_synthetic,
             variants=variants,

@@ -106,6 +106,8 @@ stores:
   - D:\jannik\synchrotron-data\transduced\103L_Mg5Gd_4w_000.zarr
   - D:\jannik\synchrotron-data\transduced\…
 manifest: null                       # optional shared StoreManifest YAML
+strict: true                         # false → open stores that fail verification anyway,
+                                     #         processing only their healthy entries
 
 select:                              # which deformations per store
   real: all                          # "all" | "none" | [explicit names]
@@ -167,6 +169,7 @@ class BatchSpec:
     campaign: str
     stores: tuple[Path, ...]
     manifest: Path | None
+    strict: bool                              # → DvcDataset.open(strict=); False = skip bad sub-entries
     select_real: Literal["all", "none"] | tuple[str, ...]
     select_synthetic: Literal["all", "none"] | tuple[str, ...]
     variants: tuple[Variant, ...]

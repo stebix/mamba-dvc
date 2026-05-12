@@ -42,6 +42,16 @@ class TestBasicParsing:
     def test_devices_default_none(self) -> None:
         assert _spec().devices is None
 
+    def test_strict_defaults_true(self) -> None:
+        assert _spec().strict is True
+
+    def test_strict_can_be_disabled(self) -> None:
+        assert _spec(strict=False).strict is False
+
+    def test_strict_must_be_bool(self) -> None:
+        with pytest.raises(ValueError, match="'strict' must be a bool"):
+            _spec(strict="no")
+
     def test_from_yaml_round_trips(self, tmp_path: Path) -> None:
         cfg = tmp_path / "campaign.yaml"
         cfg.write_text(
