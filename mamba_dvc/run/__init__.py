@@ -15,17 +15,24 @@ See ``docs/plans/run-interface.md`` for the design contract.
 - :mod:`mamba_dvc.run.batch` — :class:`Job` / :class:`JobResult` /
   :func:`plan_jobs` / :func:`run_batch`: the materialize-once /
   iterate-many execution loop, resume, and result persistence.
+- :mod:`mamba_dvc.run.progress` — :class:`BatchObserver` /
+  :class:`NullObserver`: the optional progress-streaming hook passed to
+  :func:`run_batch` (the library stays print-free; the CLI plugs in a
+  Rich renderer).
 """
 
 from __future__ import annotations
 
 from mamba_dvc.run.batch import Job, JobResult, plan_jobs, run_batch
 from mamba_dvc.run.config import BatchSpec, Variant
+from mamba_dvc.run.progress import BatchObserver, NullObserver
 
 __all__ = [
+    "BatchObserver",
     "BatchSpec",
     "Job",
     "JobResult",
+    "NullObserver",
     "Variant",
     "plan_jobs",
     "run_batch",

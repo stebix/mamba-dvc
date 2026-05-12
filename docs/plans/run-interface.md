@@ -197,13 +197,46 @@ class JobResult:
     summary: Mapping[str, Any]                 # n_total, n_ok, mae, …, timings
 
 def plan_jobs(spec: BatchSpec, *, force: bool = False,
-              only: Mapping[str, Any] | None = None) -> list[Job]:
+              only: Mapping[str, str] | None = None,
+              stores: Sequence[Path] | None = None,
+              open_dataset: DatasetOpener | None = None) -> list[Job]:
     """Enumerate (store, deformation, variant); drop already-done unless force."""
 
 def run_batch(spec: BatchSpec, *, force: bool = False,
-              only: Mapping[str, Any] | None = None,
-              dry_run: bool = False) -> list[JobResult]:
-    """Execute the plan with the materialize-once / iterate-many loop."""
+              only: Mapping[str, str] | None = None,
+              stores: Sequence[Path] | None = None,
+              correlate_fn: CorrelateFn | None = None,
+              open_dataset: DatasetOpener | None = None,
+              observer: BatchObserver | None = None) -> list[JobResult]:
+    """Execute the plan with the materialize-once / iterate-many loop.
+
+    The loop is print-free. Live progress is an opt-in `observer`
+    (default `NullObserver` — silent); the CLI plugs in a Rich
+    spinner/progress bar (or a plain per-job log when stdout is not a
+    terminal). `--dry-run` lives in the CLI on top of `plan_jobs`, not
+    as a `run_batch` flag.
+    """
+```
+
+```python
+# mamba_dvc/run/progress.py — the optional live-progress hook
+
+class BatchObserver(Protocol):
+    """Hooks run_batch calls at well-defined points; implementations may
+    override any subset (subclass NullObserver for that)."""
+    def on_batch_start(self, *, n_jobs: int, n_variants: int) -> None: ...
+    def on_pair_load_start(self, store: Path, deformation: str, *, n_variants: int) -> None: ...
+    def on_job_start(self, job: Job) -> None: ...          # fired *before* the work
+    def on_job_end(self, result: JobResult) -> None: ...
+    def on_batch_end(self, results: list[JobResult]) -> None: ...
+
+class NullObserver: ...   # all no-ops; the default — keeps the library print-free
+
+# Contract: on_batch_start once (n_jobs is exact, counts store-open failures);
+# then per materialized (deformation, mask, dry_shape) slice one
+# on_pair_load_start, then an on_job_start/on_job_end pair per variant;
+# then on_batch_end once. Every recorded JobResult — including load_pair and
+# store-open failures — is bracketed by on_job_start/on_job_end.
 ```
 
 ```python
@@ -403,10 +436,6 @@ infrastructure, but blocking *useful output*):
 - **Writing fields back into the zarr store** under a `results/` group
   (the time-series pipeline's `on_pair` writer, `times-series-buildout.md`)
   — premature; flat `.npz` + manifest is enough to "gather results".
-- **`on_result` streaming callback** on `run_batch` (mirrors
-  `correlate_series`'s `on_pair`) — only worth it once a campaign is
-  large enough that holding `JobResult`s in memory matters; the
-  append-to-`manifest.jsonl`-per-result already gives crash-safety.
 - **Cross-store / cross-deformation aggregation reports** (the
   `ErrorReport`-rollup tables) — that's a notebook concern over
   `manifest.jsonl`, not the driver's job.

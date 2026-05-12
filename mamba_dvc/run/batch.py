@@ -12,9 +12,11 @@ See ``docs/plans/run-interface.md`` §2 (invariants) and §6 (flow).
 
 Two deliberate deviations from the plan's §5 sketch:
 
-- ``run_batch`` does not take a ``dry_run`` flag and never prints; the
-  preview is :func:`plan_jobs` plus the CLI's own rendering. Keeping
-  the library side print-free is the reason.
+- ``run_batch`` does not take a ``dry_run`` flag and never prints. The
+  preview is :func:`plan_jobs` plus the CLI's own rendering; live
+  progress is an opt-in :class:`~mamba_dvc.run.progress.BatchObserver`
+  (the CLI supplies a Rich one). Keeping the library side print-free is
+  the reason.
 - The pinned-memory OOM retry is a single fallback to a 2-GPU subset
   (only when ``devices`` was given explicitly), not a multi-step ladder.
   The real fix — non-pinned host staging in ``gpu.dispatch`` — is
@@ -45,6 +47,7 @@ from mamba_dvc.gpu.dispatch import correlate_multi_gpu
 from mamba_dvc.io.dataset import NO_MASK, DvcDataset, EvaluationPair
 from mamba_dvc.io.manifest import StoreManifest
 from mamba_dvc.run.config import BatchSpec, Variant, knob_names, slug_value
+from mamba_dvc.run.progress import BatchObserver, NullObserver
 from mamba_dvc.types import DisplacementField, POIStatus
 from mamba_dvc.validate.known_fields import ErrorReport, evaluate_pair
 
@@ -89,6 +92,21 @@ class JobResult:
     sidecar_path: Path | None
     error: str | None  # traceback when ``status == "failed"``
     summary: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _StoreTask:
+    """One store's place in the campaign plan.
+
+    Either ``open_failure`` is ``None`` and ``jobs`` is the store's
+    non-empty list of pending jobs, or ``open_failure`` carries the
+    formatted traceback from a failed ``opener`` call and ``jobs`` is
+    empty (the store contributes a single store-level failure result).
+    """
+
+    store: Path
+    jobs: tuple[Job, ...]
+    open_failure: str | None
 
 
 # ----------------------------------------------------------------- planning
@@ -179,6 +197,35 @@ def _store_jobs(
     return out
 
 
+def _plan_campaign(
+    spec: BatchSpec,
+    target_stores: Sequence[Path],
+    opener: DatasetOpener,
+    *,
+    force: bool,
+    only: Mapping[str, str] | None,
+) -> list[_StoreTask]:
+    """Open each target store and enumerate its pending jobs (campaign phase 1).
+
+    A store that fails to open becomes a :class:`_StoreTask` with
+    ``open_failure`` set; a store that opens but has nothing pending is
+    omitted. Listing entries does not depend on ``flow_convention``, so a
+    single open per store suffices here — :func:`run_batch` re-opens per
+    convention when it actually loads pairs.
+    """
+    tasks: list[_StoreTask] = []
+    for store in target_stores:
+        try:
+            ds = opener(store, None)
+            jobs = _store_jobs(spec, store, ds, spec.campaign_dir, force=force, only=only)
+        except Exception:
+            tasks.append(_StoreTask(store=store, jobs=(), open_failure=traceback.format_exc()))
+            continue
+        if jobs:
+            tasks.append(_StoreTask(store=store, jobs=tuple(jobs), open_failure=None))
+    return tasks
+
+
 # ----------------------------------------------------------------- execution
 
 
@@ -190,16 +237,18 @@ def run_batch(
     stores: Sequence[Path] | None = None,
     correlate_fn: _CorrelateFn | None = None,
     open_dataset: DatasetOpener | None = None,
+    observer: BatchObserver | None = None,
 ) -> list[JobResult]:
     """Execute the campaign with the materialize-once / iterate-many loop.
 
     Writes ``config.snapshot.yaml`` (or a serialised copy of the parsed
-    config), then for every pending job: ``correlate`` → ``evaluate``
-    (synthetic only) → write ``<variant_id>.npz`` + ``.json``, appending
-    a row to ``manifest.jsonl`` as it goes. ``variants.json`` is
-    refreshed at the end. Already-done jobs are skipped (resume); a
-    failed job (store open, ``load_pair``, ``correlate``, ``evaluate``,
-    or write) is recorded and the run continues.
+    config), enumerates the pending work, then for every job:
+    ``correlate`` → ``evaluate`` (synthetic only) → write
+    ``<variant_id>.npz`` + ``.json``, appending a row to ``manifest.jsonl``
+    as it goes. ``variants.json`` is refreshed at the end. Already-done
+    jobs are skipped (resume); a failed job (store open, ``load_pair``,
+    ``correlate``, ``evaluate``, or write) is recorded and the run
+    continues.
 
     Parameters
     ----------
@@ -212,6 +261,11 @@ def run_batch(
         defaults to it. Lets tests / custom dispatch paths slot in.
     open_dataset
         Optional opener override; see :data:`DatasetOpener`.
+    observer
+        Optional :class:`~mamba_dvc.run.progress.BatchObserver` for live
+        progress. ``None`` (the default) uses
+        :class:`~mamba_dvc.run.progress.NullObserver`, so the run stays
+        silent — see that module for the event contract.
 
     Returns
     -------
@@ -228,6 +282,7 @@ def run_batch(
     correlate = correlate_fn or correlate_multi_gpu
     opener = open_dataset or _make_default_opener(spec)
     target_stores = _select_target_stores(spec.stores, stores)
+    obs: BatchObserver = observer if observer is not None else NullObserver()
     campaign_dir = spec.campaign_dir
 
     _warn_if_convention_unpinned(spec)
@@ -236,52 +291,55 @@ def run_batch(
     manifest_path = campaign_dir / "manifest.jsonl"
     _write_config_snapshot(spec, campaign_dir)
 
+    tasks = _plan_campaign(spec, target_stores, opener, force=force, only=only)
+    n_jobs = sum(1 if t.open_failure is not None else len(t.jobs) for t in tasks)
+    obs.on_batch_start(n_jobs=n_jobs, n_variants=len(spec.variants))
+
     results: list[JobResult] = []
 
     def _record(jr: JobResult) -> None:
         results.append(jr)
         _append_manifest_row(manifest_path, spec, jr)
+        obs.on_job_end(jr)
 
-    for store in target_stores:
-        # Enumerate this store's pending jobs (entry listing does not
-        # depend on flow_convention, so a single open suffices here).
-        try:
-            ds_probe = opener(store, None)
-            jobs = _store_jobs(spec, store, ds_probe, campaign_dir, force=force, only=only)
-        except Exception:
+    for task in tasks:
+        if task.open_failure is not None:
+            placeholder = Job(
+                store=task.store,
+                deformation=_STORE_LEVEL,
+                kind="?",
+                variant=spec.variants[0],
+            )
+            obs.on_job_start(placeholder)
             _record(
                 JobResult(
-                    job=Job(
-                        store=store,
-                        deformation=_STORE_LEVEL,
-                        kind="?",
-                        variant=spec.variants[0],
-                    ),
+                    job=placeholder,
                     status="failed",
                     npz_path=None,
                     sidecar_path=None,
-                    error=traceback.format_exc(),
+                    error=task.open_failure,
                     summary={"phase": "open_store"},
                 )
             )
             continue
-        if not jobs:
-            continue
 
-        # Group by flow_convention → one (possibly re-opened) dataset each.
+        # Group by flow_convention → one (re-opened) dataset per convention.
         for convention, conv_jobs in _group_by(
-            jobs, lambda j: j.variant.load_params["flow_convention"]
+            task.jobs, lambda j: j.variant.load_params["flow_convention"]
         ):
             try:
-                ds = opener(store, convention)
+                ds = opener(task.store, convention)
             except Exception:
+                tb = traceback.format_exc()
                 for job in conv_jobs:
-                    _record(_failed(job, "open_store", traceback.format_exc()))
+                    obs.on_job_start(job)
+                    _record(_failed(job, "open_store", tb))
                 continue
 
             # Group by (deformation, mask, dry_shape) → one load_pair each.
             for load_key, load_jobs in _group_by(conv_jobs, _load_group_key):
                 deformation, mask_sel, dry_shape = load_key
+                obs.on_pair_load_start(task.store, deformation, n_variants=len(load_jobs))
                 try:
                     pair = ds.load_pair(
                         deformation,
@@ -289,13 +347,16 @@ def run_batch(
                         dry_shape=dry_shape,
                     )
                 except Exception:
+                    tb = traceback.format_exc()
                     for job in load_jobs:
-                        _record(_failed(job, "load_pair", traceback.format_exc()))
+                        obs.on_job_start(job)
+                        _record(_failed(job, "load_pair", tb))
                     continue
 
                 truth_cache: dict[tuple[Any, ...], np.ndarray] = {}
                 # Sort by grid params so adjacent variants reuse the cache.
                 for job in sorted(load_jobs, key=lambda j: _grid_key(j.variant)):
+                    obs.on_job_start(job)
                     _record(
                         _run_variant(spec, pair, job, correlate, truth_cache, campaign_dir)
                     )
@@ -306,6 +367,7 @@ def run_batch(
                 gc.collect()
 
     _write_variants_index(spec, campaign_dir)
+    obs.on_batch_end(results)
     return results
 
 

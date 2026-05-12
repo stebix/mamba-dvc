@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from mamba_dvc.run import plan_jobs, run_batch
+from mamba_dvc.run import NullObserver, plan_jobs, run_batch
 from mamba_dvc.run.config import BatchSpec
 from mamba_dvc.types import DisplacementField
 
@@ -279,6 +279,143 @@ class TestOnlyFilter:
         spec = _spec(tmp_path, stores=["scanA.zarr"])
         with pytest.raises(ValueError, match="unknown knob"):
             plan_jobs(spec, only={"nope": "1"})
+
+
+class _RecordingObserver(NullObserver):
+    """Logs a tag tuple for every event so tests can assert ordering and counts."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple] = []
+
+    def on_batch_start(self, *, n_jobs: int, n_variants: int) -> None:
+        self.events.append(("batch_start", n_jobs, n_variants))
+
+    def on_pair_load_start(self, store, deformation: str, *, n_variants: int) -> None:
+        self.events.append(("pair_load_start", store.name, deformation, n_variants))
+
+    def on_job_start(self, job) -> None:
+        self.events.append(("job_start", job.deformation, job.variant.variant_id))
+
+    def on_job_end(self, result) -> None:
+        self.events.append(("job_end", result.job.deformation, result.status))
+
+    def on_batch_end(self, results) -> None:
+        self.events.append(("batch_end", len(results)))
+
+    def tags(self) -> list[str]:
+        return [e[0] for e in self.events]
+
+
+class TestObserver:
+    def test_event_sequence_for_a_small_campaign(self, tmp_path: Path) -> None:
+        store = tmp_path / "scanA.zarr"
+        ds = _FakeDataset(real=[], synthetic=["fs1", "fs2"])
+        spec = _spec(tmp_path, stores=["scanA.zarr"], sweep={"mask_threshold": [0.7, 0.5]})
+        obs = _RecordingObserver()
+        results = run_batch(
+            spec,
+            correlate_fn=_fake_correlate,
+            open_dataset=_opener_for({store: ds}),
+            observer=obs,
+        )
+        assert len(results) == 4
+        assert obs.events[0] == ("batch_start", 4, 2)
+        assert obs.events[-1] == ("batch_end", 4)
+        # one load per deformation; one job_start/job_end pair per job; serial work.
+        assert obs.tags() == [
+            "batch_start",
+            "pair_load_start", "job_start", "job_end", "job_start", "job_end",
+            "pair_load_start", "job_start", "job_end", "job_start", "job_end",
+            "batch_end",
+        ]  # fmt: skip
+
+    def test_failed_variant_still_bracketed(self, tmp_path: Path) -> None:
+        store = tmp_path / "scanA.zarr"
+        ds = _FakeDataset(real=[], synthetic=["fs1"])
+        spec = _spec(tmp_path, stores=["scanA.zarr"], sweep={"mask_threshold": [0.9, 0.5]})
+
+        def flaky(
+            reference, deformed, mask=None, *, device_ids=None, mask_threshold=0.9, **kw
+        ):
+            if mask_threshold == 0.5:
+                raise RuntimeError("boom")
+            return _make_field()
+
+        obs = _RecordingObserver()
+        run_batch(
+            spec, correlate_fn=flaky, open_dataset=_opener_for({store: ds}), observer=obs
+        )
+        assert obs.tags().count("job_start") == obs.tags().count("job_end") == 2
+        assert ("job_end", "fs1", "failed") in obs.events
+        assert ("job_end", "fs1", "ok") in obs.events
+
+    def test_load_pair_failure_brackets_each_variant(self, tmp_path: Path) -> None:
+        store = tmp_path / "scanA.zarr"
+        ds = _FakeDataset(real=[], synthetic=["fs1"])
+        spec = _spec(tmp_path, stores=["scanA.zarr"], sweep={"mask_threshold": [0.9, 0.5]})
+
+        def boom_load(deformation, *, mask=None, dry_shape=None):
+            raise OSError("disk gone")
+
+        ds.load_pair = boom_load  # break load_pair after the dataset opens fine
+        obs = _RecordingObserver()
+        run_batch(
+            spec,
+            correlate_fn=_fake_correlate,
+            open_dataset=_opener_for({store: ds}),
+            observer=obs,
+        )
+        assert obs.tags().count("pair_load_start") == 1
+        assert obs.tags().count("job_start") == 2  # one per variant in the broken load group
+        assert all(e[2] == "failed" for e in obs.events if e[0] == "job_end")
+
+    def test_store_open_failure_is_one_bracketed_job(self, tmp_path: Path) -> None:
+        spec = _spec(tmp_path, stores=["broken.zarr"])
+
+        def bad_opener(store, flow_convention):
+            raise FileNotFoundError("nope")
+
+        obs = _RecordingObserver()
+        results = run_batch(
+            spec, correlate_fn=_fake_correlate, open_dataset=bad_opener, observer=obs
+        )
+        assert obs.events[0] == ("batch_start", 1, 1)
+        assert ("job_start", "*", results[0].job.variant.variant_id) in obs.events
+        assert ("job_end", "*", "failed") in obs.events
+        assert obs.events[-1] == ("batch_end", 1)
+        assert "pair_load_start" not in obs.tags()  # never opened → no load attempted
+
+    def test_null_observer_accepted_as_default(self, tmp_path: Path) -> None:
+        store = tmp_path / "scanA.zarr"
+        ds = _FakeDataset(real=[], synthetic=["fs1"])
+        spec = _spec(tmp_path, stores=["scanA.zarr"])
+        results = run_batch(
+            spec,
+            correlate_fn=_fake_correlate,
+            open_dataset=_opener_for({store: ds}),
+            observer=NullObserver(),
+        )
+        assert [r.status for r in results] == ["ok"]
+
+
+class TestStrictForwarding:
+    def test_default_opener_forwards_strict_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from mamba_dvc.run.batch import _make_default_opener
+
+        captured: dict[str, object] = {}
+
+        class _StubDataset:
+            @classmethod
+            def open(cls, store, *, manifest=None, strict=True):
+                captured["strict"] = strict
+                return object()
+
+        monkeypatch.setattr("mamba_dvc.run.batch.DvcDataset", _StubDataset)
+        spec = _spec(tmp_path, stores=["s.zarr"], strict=False)
+        _make_default_opener(spec)(tmp_path / "s.zarr", None)
+        assert captured["strict"] is False
 
 
 class TestConventionWarning:
