@@ -156,6 +156,135 @@ class TestFailureIsolation:
         )
 
 
+class _StubDispatcher:
+    """In-Python stand-in for :class:`MultiGPUDispatcher`.
+
+    Records every ``(reference, deformed)`` call so tests can assert
+    the driver chose the right pairing semantics. Returns a trivial
+    zero-displacement field with all POIs ``OK`` -- the assertions are
+    on the call pattern, not the per-pair accuracy.
+    """
+
+    def __init__(self, grid_shape: tuple[int, int, int], *, has_anchored: bool) -> None:
+        from mamba_dvc.core.grid import build_grid
+
+        self._grid = build_grid((48, 48, 48), window=24, overlap=0.5)
+        self.has_anchored_reference = has_anchored
+        self.calls: list[tuple[np.ndarray | None, np.ndarray]] = []
+
+    def correlate(
+        self,
+        reference: np.ndarray | None,
+        deformed: np.ndarray,
+    ) -> DisplacementField:
+        self.calls.append((reference, deformed))
+        n_points = int(np.prod(self._grid.grid_shape))
+        return DisplacementField(
+            positions=self._grid.positions,
+            displacements=np.zeros((n_points, 3), dtype=np.float32),
+            valid=np.ones(n_points, dtype=np.bool_),
+            confidence=np.ones(n_points, dtype=np.float32),
+            status=np.zeros(n_points, dtype=np.uint8),
+            grid_shape=self._grid.grid_shape,
+            spacing=self._grid.spacing,
+            window=self._grid.window,
+        )
+
+
+class TestDispatcherBranch:
+    """The dispatcher kwarg routes every pair through ``dispatcher.correlate``.
+
+    Uses an in-Python stub so this can run on CPU-only hosts. The real
+    multi-GPU plumbing is exercised by ``tests/gpu/test_dispatch.py``.
+    """
+
+    def test_sequential_passes_prev_and_next_explicitly(self):
+        shape = (48, 48, 48)
+        ref, frames = _make_frames(shape, [(0.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        stub = _StubDispatcher(shape, has_anchored=False)
+
+        correlate_series(
+            enumerate([ref, *frames]),
+            strategy=PairingStrategy.SEQUENTIAL,
+            dispatcher=stub,  # type: ignore[arg-type]
+            **_correlator_kwargs(),
+        )
+
+        # SEQUENTIAL with no anchored reference: every call carries
+        # the previous frame as the explicit reference.
+        assert len(stub.calls) == 2
+        for prev, _deformed in stub.calls:
+            assert prev is not None
+        # Pair 1: (ref, frames[0]); pair 2: (frames[0], frames[1]).
+        np.testing.assert_array_equal(stub.calls[0][0], ref)
+        np.testing.assert_array_equal(stub.calls[0][1], frames[0])
+        np.testing.assert_array_equal(stub.calls[1][0], frames[0])
+        np.testing.assert_array_equal(stub.calls[1][1], frames[1])
+
+    def test_anchored_with_resident_reference_passes_none(self):
+        shape = (48, 48, 48)
+        ref, frames = _make_frames(shape, [(0.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        stub = _StubDispatcher(shape, has_anchored=True)
+
+        correlate_series(
+            enumerate([ref, *frames]),
+            strategy=PairingStrategy.REFERENCE_ANCHORED,
+            dispatcher=stub,  # type: ignore[arg-type]
+            **_correlator_kwargs(),
+        )
+
+        # REFERENCE_ANCHORED with dispatcher.has_anchored_reference=True:
+        # the driver skips re-uploading the reference -- every call
+        # receives reference=None.
+        assert len(stub.calls) == 2
+        for prev, _deformed in stub.calls:
+            assert prev is None
+        np.testing.assert_array_equal(stub.calls[0][1], frames[0])
+        np.testing.assert_array_equal(stub.calls[1][1], frames[1])
+
+    def test_anchored_without_resident_reference_passes_seed(self):
+        shape = (48, 48, 48)
+        ref, frames = _make_frames(shape, [(0.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        stub = _StubDispatcher(shape, has_anchored=False)
+
+        correlate_series(
+            enumerate([ref, *frames]),
+            strategy=PairingStrategy.REFERENCE_ANCHORED,
+            dispatcher=stub,  # type: ignore[arg-type]
+            **_correlator_kwargs(),
+        )
+
+        # REFERENCE_ANCHORED without resident anchor: the driver passes
+        # the seed frame explicitly on every call.
+        assert len(stub.calls) == 2
+        for prev, _deformed in stub.calls:
+            np.testing.assert_array_equal(prev, ref)
+
+    def test_dispatcher_failure_records_failed_status(self):
+        shape = (48, 48, 48)
+        ref, frames = _make_frames(shape, [(0.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+
+        class _FlakyDispatcher(_StubDispatcher):
+            def correlate(self, reference, deformed):  # type: ignore[override]
+                self.calls.append((reference, deformed))
+                if len(self.calls) == 1:
+                    raise RuntimeError("synthetic dispatcher failure")
+                return super().correlate(reference, deformed)
+
+        stub = _FlakyDispatcher(shape, has_anchored=False)
+
+        with pytest.warns(RuntimeWarning, match="failed"):
+            series = correlate_series(
+                enumerate([ref, *frames]),
+                strategy=PairingStrategy.SEQUENTIAL,
+                dispatcher=stub,  # type: ignore[arg-type]
+                **_correlator_kwargs(),
+            )
+
+        assert int(series.pair_status[0]) == int(SeriesPairStatus.FAILED)
+        assert int(series.pair_status[1]) == int(SeriesPairStatus.OK)
+
+
 class TestInputValidation:
     def test_empty_iterator_raises(self):
         with pytest.raises(ValueError, match="empty"):

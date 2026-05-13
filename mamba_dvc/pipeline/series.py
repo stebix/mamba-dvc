@@ -38,6 +38,7 @@ import numpy as np
 from jaxtyping import Bool, Float32
 
 from mamba_dvc.core.grid import build_grid
+from mamba_dvc.gpu.dispatch import MultiGPUDispatcher
 from mamba_dvc.pipeline._internal import NCCMode, NCCNormalization
 from mamba_dvc.pipeline.correlate import correlate
 from mamba_dvc.types import (
@@ -56,6 +57,7 @@ def correlate_series(
     mask: Bool[np.ndarray, "z y x"] | None = None,
     *,
     strategy: PairingStrategy = PairingStrategy.SEQUENTIAL,
+    dispatcher: MultiGPUDispatcher | None = None,
     on_pair: Callable[[int, DisplacementField], None] | None = None,
     window: int | tuple[int, int, int] = 96,
     overlap: float = 0.5,
@@ -88,6 +90,19 @@ def correlate_series(
         pairs ``(first, next)``;
         :data:`PairingStrategy.UPDATED_REFERENCE` raises until the v2
         warper lands.
+    dispatcher
+        Optional opened :class:`mamba_dvc.gpu.dispatch.MultiGPUDispatcher`.
+        When supplied, every pair routes through the persistent pool so
+        the spawn + CUDA-init cost is paid once for the whole series
+        instead of per pair. The dispatcher must be opened by the caller
+        (``with MultiGPUDispatcher(...) as d:``) and its
+        ``volume_shape`` must match the seed frame. For
+        :data:`PairingStrategy.REFERENCE_ANCHORED` series, if the
+        dispatcher was built with an ``anchored_reference``, the driver
+        skips re-uploading the reference each call. When ``None``
+        (default), pairs go through the host-only
+        :func:`mamba_dvc.pipeline.correlate.correlate` -- useful for
+        tests and CPU-only dev machines.
     on_pair
         Optional callback ``(t_def, field)`` fired after each pair
         completes (success or failure). The sole side-channel out of
@@ -168,6 +183,18 @@ def correlate_series(
             window=grid.window,
         )
 
+    # Resolve dispatcher path once: when one is supplied, every pair
+    # routes through the pool; when not, every pair calls the pure
+    # host-only ``correlate()``. The branch lives outside the per-pair
+    # try/except so the dispatcher's per-pair RuntimeError is caught
+    # alongside any other failure mode.
+    use_dispatcher = dispatcher is not None
+    anchored_via_dispatcher = (
+        use_dispatcher
+        and dispatcher.has_anchored_reference  # pyright: ignore[reportOptionalMemberAccess]
+        and strategy is PairingStrategy.REFERENCE_ANCHORED
+    )
+
     def _run_pair(
         reference: Float32[np.ndarray, "z y x"],
         deformed: Float32[np.ndarray, "z y x"],
@@ -178,20 +205,25 @@ def correlate_series(
         # isolation is the buildout-doc contract. KeyboardInterrupt /
         # SystemExit derive from BaseException and bypass this branch.
         try:
-            field = correlate(
-                reference,
-                deformed,
-                mask=mask,
-                window=window,
-                overlap=overlap,
-                mask_threshold=mask_threshold,
-                tukey_alpha=tukey_alpha,
-                search_radius=search_radius,
-                batch_size=batch_size,
-                eps=eps,
-                ncc_mode=ncc_mode,
-                ncc_normalization=ncc_normalization,
-            )
+            if use_dispatcher:
+                assert dispatcher is not None  # narrowed by use_dispatcher
+                ref_arg = None if anchored_via_dispatcher else reference
+                field = dispatcher.correlate(ref_arg, deformed)
+            else:
+                field = correlate(
+                    reference,
+                    deformed,
+                    mask=mask,
+                    window=window,
+                    overlap=overlap,
+                    mask_threshold=mask_threshold,
+                    tukey_alpha=tukey_alpha,
+                    search_radius=search_radius,
+                    batch_size=batch_size,
+                    eps=eps,
+                    ncc_mode=ncc_mode,
+                    ncc_normalization=ncc_normalization,
+                )
             return field, SeriesPairStatus.OK
         except Exception as exc:
             warnings.warn(
