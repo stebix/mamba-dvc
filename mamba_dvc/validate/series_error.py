@@ -29,13 +29,15 @@ from __future__ import annotations
 import itertools
 import warnings
 from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from jaxtyping import Bool, Float32, Int64, UInt8
 
 from mamba_dvc.core.grid import build_grid
+from mamba_dvc.gpu.dispatch import MultiGPUDispatcher
 from mamba_dvc.pipeline._internal import NCCMode, NCCNormalization
 from mamba_dvc.pipeline.series import correlate_series
 from mamba_dvc.types import (
@@ -157,6 +159,7 @@ def evaluate_synthetic(
     strategies: Sequence[PairingStrategy] = _DEFAULT_STRATEGIES,
     lags: Sequence[int] = (1,),
     mask: Bool[np.ndarray, "z y x"] | None = None,
+    device_ids: Sequence[int] | None = None,
     warp_order: int = 3,
     cumulative_interpolation: Literal["linear", "cubic"] = "linear",
     window: int | tuple[int, int, int] = 96,
@@ -219,6 +222,16 @@ def evaluate_synthetic(
     mask
         Optional shared validity mask. Forwarded to both
         :func:`make_series` and :func:`correlate_series`.
+    device_ids
+        Optional GPU indices to dispatch correlation across. When set,
+        the sweep opens one persistent :class:`MultiGPUDispatcher` and
+        routes every ``(strategy, lag)`` correlation through it -- the
+        spawn + CUDA-init cost is paid once for the whole sweep
+        instead of per pair. When ``None`` (default), correlation runs
+        on the host through :func:`correlate_series` 's CPU fallback.
+        Note: the dispatcher is built without an ``anchored_reference``
+        because the sweep mixes strategies; ``REFERENCE_ANCHORED``
+        pairs therefore still re-upload the reference each call.
     warp_order
         Spline order for :func:`scipy.ndimage.map_coordinates` used
         inside frame synthesis. Default ``3`` (cubic); set to ``1`` for
@@ -335,44 +348,66 @@ def evaluate_synthetic(
     per_pair_out: dict[tuple[PairingStrategy, int], PerPairErrorTable] = {}
     cumulative_out: dict[tuple[PairingStrategy, int], CumulativeDriftTable] = {}
 
-    for lag in lags_tuple:
-        selected_ts = ts[::lag]
-        selected_frames = series_bundle.frames[::lag]
-        if len(selected_ts) < 2:
-            warnings.warn(
-                f"lag={lag} subsamples timesteps to {len(selected_ts)} frame(s);"
-                " no pairs are possible — skipping every strategy at this lag.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            continue
+    # Open one dispatcher for the whole sweep when device_ids is given;
+    # otherwise the ``correlate_series`` fallback runs on the host.
+    if device_ids is not None:
+        dispatcher_cm: Any = MultiGPUDispatcher(
+            device_ids=device_ids,
+            mask=mask,
+            volume_shape=shape,
+            window=window,
+            overlap=overlap,
+            mask_threshold=mask_threshold,
+            tukey_alpha=tukey_alpha,
+            search_radius=search_radius,
+            batch_size=batch_size,
+            eps=eps,
+            ncc_mode=ncc_mode,
+            ncc_normalization=ncc_normalization,
+        )
+    else:
+        dispatcher_cm = nullcontext(None)
 
-        for strategy in strategies_tuple:
-            frame_iter = zip(selected_ts, selected_frames, strict=True)
-            series_result = correlate_series(
-                frame_iter,
-                mask=mask,
-                strategy=strategy,
-                window=window,
-                overlap=overlap,
-                mask_threshold=mask_threshold,
-                tukey_alpha=tukey_alpha,
-                search_radius=search_radius,
-                batch_size=batch_size,
-                eps=eps,
-                ncc_mode=ncc_mode,
-                ncc_normalization=ncc_normalization,
-            )
-
-            per_pair_out[(strategy, lag)] = _per_pair_table(series_result, gt_per_t)
-
-            if strategy is PairingStrategy.SEQUENTIAL:
-                cumulative_fields = series_result.cumulative(
-                    interpolation=cumulative_interpolation
+    with dispatcher_cm as dispatcher:
+        for lag in lags_tuple:
+            selected_ts = ts[::lag]
+            selected_frames = series_bundle.frames[::lag]
+            if len(selected_ts) < 2:
+                warnings.warn(
+                    f"lag={lag} subsamples timesteps to {len(selected_ts)} frame(s);"
+                    " no pairs are possible — skipping every strategy at this lag.",
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
-                cumulative_out[(strategy, lag)] = _cumulative_table(
-                    cumulative_fields, series_result, gt_per_t
+                continue
+
+            for strategy in strategies_tuple:
+                frame_iter = zip(selected_ts, selected_frames, strict=True)
+                series_result = correlate_series(
+                    frame_iter,
+                    mask=mask,
+                    strategy=strategy,
+                    dispatcher=dispatcher,
+                    window=window,
+                    overlap=overlap,
+                    mask_threshold=mask_threshold,
+                    tukey_alpha=tukey_alpha,
+                    search_radius=search_radius,
+                    batch_size=batch_size,
+                    eps=eps,
+                    ncc_mode=ncc_mode,
+                    ncc_normalization=ncc_normalization,
                 )
+
+                per_pair_out[(strategy, lag)] = _per_pair_table(series_result, gt_per_t)
+
+                if strategy is PairingStrategy.SEQUENTIAL:
+                    cumulative_fields = series_result.cumulative(
+                        interpolation=cumulative_interpolation
+                    )
+                    cumulative_out[(strategy, lag)] = _cumulative_table(
+                        cumulative_fields, series_result, gt_per_t
+                    )
 
     return SyntheticEvalReport(
         per_pair=per_pair_out,

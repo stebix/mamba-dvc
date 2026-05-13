@@ -139,6 +139,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Spline order for frame synthesis (1 or 3). Default: 3.",
     )
     parser.add_argument(
+        "--devices",
+        type=_parse_csv_ints,
+        default=None,
+        help=(
+            "Comma-separated CUDA device ids to dispatch correlation across."
+            " When set, evaluate_synthetic opens one MultiGPUDispatcher for"
+            " the whole sweep so the spawn + CUDA-init cost is paid once."
+            " Default: unset (host-only CPU path)."
+        ),
+    )
+    parser.add_argument(
         "--out",
         type=Path,
         default=Path("outputs/temporal-eval"),
@@ -296,6 +307,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"lags={tuple(args.lags)}  timesteps={timesteps[0]}..{timesteps[-1]}",
         flush=True,
     )
+    if args.devices is not None:
+        print(f"Dispatcher: MultiGPUDispatcher device_ids={tuple(args.devices)}", flush=True)
+    else:
+        print("Dispatcher: none (host-only CPU path)", flush=True)
     if args.ephemeral:
         print("Mode: ephemeral (no filesystem writes)", flush=True)
     else:
@@ -308,6 +323,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         timesteps,
         strategies=_DEFAULT_STRATEGIES,
         lags=args.lags,
+        device_ids=args.devices,
         window=args.window,
         overlap=args.overlap,
         warp_order=args.warp_order,
