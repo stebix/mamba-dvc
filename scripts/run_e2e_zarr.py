@@ -32,7 +32,7 @@ import platform
 import sys
 import time
 import traceback
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +44,7 @@ import zarr
 from mamba_dvc.core.ncc import NCCMode, NCCNormalization
 from mamba_dvc.gpu.budget import is_cupy_available, probe_free_vram
 from mamba_dvc.gpu.dispatch import correlate_multi_gpu
+from mamba_dvc.instrument import accumulating
 from mamba_dvc.io.dataset import NO_MASK, DvcDataset, EvaluationPair
 from mamba_dvc.io.field import FieldConvention
 from mamba_dvc.io.manifest import StoreManifest
@@ -193,6 +194,15 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--report", type=Path, default=None, help="Optional plain-text report path."
+    )
+    p.add_argument(
+        "--timing",
+        action="store_true",
+        help=(
+            "Accumulate per-phase wall times (mamba_dvc.instrument) and append a "
+            "breakdown to the report. Fullest with --devices 0 — multi-GPU worker "
+            "subprocesses do not propagate their NCC sub-phase records to the parent."
+        ),
     )
     return p
 
@@ -445,10 +455,16 @@ def _apply_flow_convention_override(
     return replace(base, synthetic=new_synthetic)
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Run the harness and return a process exit code (0 = ok, 1 = exception)."""
-    args = _build_argparser().parse_args(argv)
-    metrics = RunMetrics()
+def _run_pipeline(
+    args: argparse.Namespace, metrics: RunMetrics
+) -> tuple[dict[str, Any] | None, ErrorReport | None, str | None]:
+    """Run open -> load -> correlate -> evaluate -> serialize, recording ``metrics``.
+
+    Returns ``(summary, error_report, error)``; ``error`` is the formatted
+    traceback string when any phase raised, else ``None``. Kept separate
+    from :func:`main` so the optional timing accumulator can wrap the
+    whole pipeline without re-indenting it.
+    """
     summary: dict[str, Any] | None = None
     error: str | None = None
     field_result: DisplacementField | None = None
@@ -534,7 +550,21 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         error = traceback.format_exc()
 
+    return summary, err_report, error
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the harness and return a process exit code (0 = ok, 1 = exception)."""
+    args = _build_argparser().parse_args(argv)
+    metrics = RunMetrics()
+
+    timing_cm = accumulating() if args.timing else nullcontext(None)
+    with timing_cm as acc:
+        summary, err_report, error = _run_pipeline(args, metrics)
+
     report = _render_report(args, metrics, summary, err_report, error)
+    if acc is not None:
+        report += "\n" + acc.render(title="== phase breakdown — wall seconds ==") + "\n"
     sys.stdout.write(report)
     if args.report is not None:
         args.report.write_text(report, encoding="utf-8")

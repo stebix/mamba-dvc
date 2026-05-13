@@ -32,6 +32,7 @@ from rich.progress import (
 from rich.table import Table
 from rich.text import Text
 
+from mamba_dvc.instrument import accumulating
 from mamba_dvc.run import BatchSpec, Job, JobResult, NullObserver, plan_jobs, run_batch
 
 __all__ = ["run"]
@@ -119,12 +120,38 @@ def run(
             help="Restrict to a subset of stores (by path or .zarr name; repeatable).",
         ),
     ] = None,
+    prefetch: Annotated[
+        int | None,
+        typer.Option(
+            "--prefetch",
+            min=0,
+            help=(
+                "How many load groups to fetch ahead in a background thread "
+                "(0 disables). Overlapping the next pair's zarr read with the "
+                "current pair's correlate roughly halves campaign wall time when "
+                "a load costs about as much as a group's variants. Default: the "
+                "config's value (1)."
+            ),
+        ),
+    ] = None,
     quiet: Annotated[
         bool,
         typer.Option(
             "--quiet",
             "-q",
             help="Suppress the live progress line; still print the end-of-run summary.",
+        ),
+    ] = False,
+    timing: Annotated[
+        bool,
+        typer.Option(
+            "--timing",
+            help=(
+                "Accumulate per-phase wall times across the campaign and print a "
+                "breakdown table at the end. Adds a small GPU-sync overhead "
+                "(diagnostic mode); per-pair NCC sub-phases only appear on the "
+                "single-GPU path."
+            ),
         ),
     ] = False,
     no_color: Annotated[
@@ -147,6 +174,8 @@ def run(
     device_override = _parse_devices(devices)
     if device_override is not None:
         spec = replace(spec, devices=device_override)
+    if prefetch is not None:
+        spec = replace(spec, prefetch=prefetch)
     store_subset = store or None
 
     console = Console(no_color=no_color, width=140)
@@ -160,20 +189,39 @@ def run(
         _render_plan(console, spec, jobs)
         raise typer.Exit(0)
 
+    timing_table: str | None = None
     try:
-        results = _execute_campaign(
-            spec,
-            force=force,
-            only=only_filter,
-            stores=store_subset,
-            console=console,
-            quiet=quiet,
-        )
+        if timing:
+            with accumulating() as acc:
+                results = _execute_campaign(
+                    spec,
+                    force=force,
+                    only=only_filter,
+                    stores=store_subset,
+                    console=console,
+                    quiet=quiet,
+                )
+            timing_table = acc.render(
+                title="campaign phase breakdown — wall seconds (sub-phases nest under totals)"
+            )
+        else:
+            results = _execute_campaign(
+                spec,
+                force=force,
+                only=only_filter,
+                stores=store_subset,
+                console=console,
+                quiet=quiet,
+            )
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
 
     _render_results(console, spec, results)
+    if timing_table is not None:
+        console.print(
+            Panel(Text(timing_table), title="timing", border_style="cyan", expand=False)
+        )
     n_failed = sum(1 for r in results if r.status == "failed")
     raise typer.Exit(1 if n_failed else 0)
 
