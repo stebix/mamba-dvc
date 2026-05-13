@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -398,6 +399,89 @@ class TestObserver:
         assert [r.status for r in results] == ["ok"]
 
 
+class TestBoundaryIndexAmortization:
+    """The boundary-distance index is built once per materialized pair.
+
+    It replaces a full-volume ``distance_transform_edt`` that the old
+    ``evaluate_pair`` ran on every variant; the win has two halves —
+    the cheaper per-call algorithm *and* computing it once across a
+    ``mask_threshold`` sweep instead of once per threshold. This pins
+    the second half: ``BoundaryDistanceIndex.from_mask`` is called once
+    per (scored) load group, zero times for real-only entries.
+    """
+
+    def _count_from_mask(self, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+        from mamba_dvc.validate.known_fields import BoundaryDistanceIndex
+
+        calls: list[int] = []
+        original = BoundaryDistanceIndex.from_mask
+
+        def spy(mask):
+            calls.append(1)
+            return original(mask)
+
+        monkeypatch.setattr(BoundaryDistanceIndex, "from_mask", staticmethod(spy))
+        return calls
+
+    def test_built_once_for_a_multi_variant_pair(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._count_from_mask(monkeypatch)
+        store = tmp_path / "scanA.zarr"
+        ds = _FakeDataset(real=[], synthetic=["fs1"])
+        spec = _spec(
+            tmp_path,
+            stores=["scanA.zarr"],
+            sweep={"mask_threshold": [0.9, 0.7, 0.5]},
+            distance_bins=[0, 5, 10],
+        )
+        results = run_batch(
+            spec, correlate_fn=_fake_correlate, open_dataset=_opener_for({store: ds})
+        )
+        assert len(results) == 3 and all(r.status == "ok" for r in results)
+        assert len(calls) == 1  # one mask -> one index, reused across the 3 variants
+        # ... and the table actually landed in each sidecar.
+        for r in results:
+            sidecar = json.loads(r.sidecar_path.read_text(encoding="utf-8"))
+            assert "by_distance" in sidecar["summary"]
+            assert sidecar["summary"]["by_distance"]["edges"] == [0, 5, 10]
+
+    def test_built_once_per_deformation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._count_from_mask(monkeypatch)
+        store = tmp_path / "scanA.zarr"
+        ds = _FakeDataset(real=[], synthetic=["fs1", "fs2"])
+        spec = _spec(
+            tmp_path,
+            stores=["scanA.zarr"],
+            sweep={"mask_threshold": [0.9, 0.5]},
+            distance_bins=[0, 5, 10],
+        )
+        run_batch(spec, correlate_fn=_fake_correlate, open_dataset=_opener_for({store: ds}))
+        assert len(calls) == 2  # one per (deformation, mask, dry_shape) load group
+
+    def test_not_built_for_real_only_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._count_from_mask(monkeypatch)
+        store = tmp_path / "scanA.zarr"
+        ds = _FakeDataset(real=["it016"], synthetic=[])
+        spec = _spec(tmp_path, stores=["scanA.zarr"], distance_bins=[0, 5, 10])
+        run_batch(spec, correlate_fn=_fake_correlate, open_dataset=_opener_for({store: ds}))
+        assert calls == []  # no GT -> no scoring -> no boundary index
+
+    def test_not_built_when_distance_bins_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = self._count_from_mask(monkeypatch)
+        store = tmp_path / "scanA.zarr"
+        ds = _FakeDataset(real=[], synthetic=["fs1"])
+        spec = _spec(tmp_path, stores=["scanA.zarr"])  # default distance_bins == ()
+        run_batch(spec, correlate_fn=_fake_correlate, open_dataset=_opener_for({store: ds}))
+        assert calls == []
+
+
 class TestStrictForwarding:
     def test_default_opener_forwards_strict_flag(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -430,3 +514,89 @@ class TestConventionWarning:
             run_batch(
                 spec, correlate_fn=_fake_correlate, open_dataset=_opener_for({store: ds})
             )
+
+
+class TestPrefetch:
+    """The background-thread load prefetch in ``run_batch`` (``spec.prefetch``)."""
+
+    @pytest.mark.parametrize("prefetch", [0, 1, 2])
+    def test_same_outcomes_regardless_of_prefetch(self, tmp_path: Path, prefetch: int) -> None:
+        # Two deformations x a 2-point sweep = 2 load groups, 2 variants each.
+        # ``tmp_path`` is unique per parametrized case, so each run is clean
+        # (no cross-run resume to muddy the comparison).
+        store = tmp_path / "scanA.zarr"
+        ds = _FakeDataset(real=[], synthetic=["fs1", "fs2"])
+        spec = _spec(
+            tmp_path,
+            stores=["scanA.zarr"],
+            sweep={"mask_threshold": [0.9, 0.5]},
+            prefetch=prefetch,
+        )
+        results = run_batch(
+            spec, correlate_fn=_fake_correlate, open_dataset=_opener_for({store: ds})
+        )
+        outcomes = sorted(
+            (r.job.deformation, r.job.variant.params_hash, r.status) for r in results
+        )
+        assert outcomes == sorted(
+            (d, v.params_hash, "ok") for d in ("fs1", "fs2") for v in spec.variants
+        )
+        # One load_pair per (deformation, mask, dry_shape), no matter the depth.
+        assert len(ds.load_pair_calls) == 2
+
+    def test_failed_prefetched_load_is_recorded_not_fatal(self, tmp_path: Path) -> None:
+        store = tmp_path / "scanA.zarr"
+        ds = _FakeDataset(real=[], synthetic=["fs1", "fs2"])
+        original = ds.load_pair
+
+        def flaky_load(deformation, **kwargs):
+            if deformation == "fs1":
+                raise RuntimeError("zarr exploded")
+            return original(deformation, **kwargs)
+
+        ds.load_pair = flaky_load
+        spec = _spec(tmp_path, stores=["scanA.zarr"], prefetch=1)
+        results = run_batch(
+            spec, correlate_fn=_fake_correlate, open_dataset=_opener_for({store: ds})
+        )
+        by_def = {r.job.deformation: r for r in results}
+        assert by_def["fs1"].status == "failed"
+        assert by_def["fs1"].summary.get("phase") == "load_pair"
+        assert "zarr exploded" in (by_def["fs1"].error or "")
+        assert by_def["fs2"].status == "ok"  # the surviving group still ran
+
+    @pytest.mark.parametrize(
+        ("prefetch", "expect_overlap", "wait_timeout"),
+        [(1, True, 5.0), (0, False, 0.3)],
+    )
+    def test_next_load_overlaps_current_correlate(
+        self, tmp_path: Path, prefetch: int, expect_overlap: bool, wait_timeout: float
+    ) -> None:
+        # fs1 is consumed (and correlated) first; with prefetch on, fs2's load
+        # is already under way in the loader thread by the time fs1's correlate
+        # runs. With prefetch off, fs2's load only happens after fs1's whole
+        # variant loop, so the event never fires during fs1's correlate.
+        store = tmp_path / "scanA.zarr"
+        ds = _FakeDataset(real=[], synthetic=["fs1", "fs2"])
+        original = ds.load_pair
+        fs2_load_started = threading.Event()
+
+        def watching_load(deformation, **kwargs):
+            if deformation == "fs2":
+                fs2_load_started.set()
+            return original(deformation, **kwargs)
+
+        ds.load_pair = watching_load
+
+        n_calls = [0]
+        overlap_observed = [False]
+
+        def correlate_fn(reference, deformed, mask=None, **kwargs):
+            n_calls[0] += 1
+            if n_calls[0] == 1:  # the fs1 correlate
+                overlap_observed[0] = fs2_load_started.wait(timeout=wait_timeout)
+            return _make_field()
+
+        spec = _spec(tmp_path, stores=["scanA.zarr"], prefetch=prefetch)
+        run_batch(spec, correlate_fn=correlate_fn, open_dataset=_opener_for({store: ds}))
+        assert overlap_observed[0] is expect_overlap

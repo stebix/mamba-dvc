@@ -323,6 +323,21 @@ Notes:
   is the source of truth.
 - **`del pair`** between entries is load-bearing — without it the next
   `load_pair` stacks another ~30 GB on RSS.
+- **Prefetch.** `BatchSpec.prefetch` (default 1) makes the loop fetch the
+  *next* `(deformation, mask, dry_shape)` group's pair in a single
+  background thread while the current group's variants run — the load is
+  the campaign's biggest single cost (~comparable to a group's whole
+  correlate + evaluate), and the variant loop is overwhelmingly
+  GIL-releasing (GPU dispatch blocked on workers, big NumPy reductions),
+  so the overlap is near-perfect (~1.9x measured). Only one load runs at
+  a time (one loader thread; more would thrash the disk and multiply
+  RSS), and a step is skipped — synchronous load — when free host RAM
+  (`psutil`) would not comfortably hold another ~30 GB pair. Results are
+  bit-identical with prefetch on/off; a failed load is still a per-job
+  `load_pair` failure, just observed one group later. `batch.load_pair`
+  timing records then measure load *wall time*, not critical-path time
+  (see `mamba_dvc.instrument`). Implemented in `_prefetched_load_groups`;
+  the "non-pinned host staging" deferral (§9) is orthogonal and open.
 - **Pinned-memory OOM** mitigation is a bounded retry ladder inside the
   variant loop: same params → `devices[:2]` → mark failed. The proper
   fix (non-pinned host staging in `dispatch`) is out of scope here;

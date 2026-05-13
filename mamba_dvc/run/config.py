@@ -105,6 +105,7 @@ _KNOWN_TOP_KEYS: frozenset[str] = frozenset(
         "variants",
         "devices",
         "distance_bins",
+        "prefetch",
         "out_dir",
     }
 )
@@ -198,6 +199,18 @@ class BatchSpec:
     distance_bins
         Boundary-stratification edges forwarded to ``evaluate_pair``.
         Empty (the default) skips the (expensive) EDT entirely.
+    prefetch
+        How many ``(deformation, mask, dry_shape)`` load groups the
+        execution loop fetches ahead in a background thread while the
+        current group's variants run (see :mod:`mamba_dvc.run.batch`).
+        ``0`` disables prefetch (purely synchronous loads). ``1`` (the
+        default) overlaps the *next* group's zarr read with the current
+        group's correlate/evaluate — roughly halving campaign wall time
+        when a load costs about as much as a group's variants. Larger
+        values keep more loads queued but only one runs at a time (one
+        loader thread), so ``1`` is the practical sweet spot; the
+        prefetch is also skipped step-by-step when free host RAM looks
+        too tight to hold another materialized pair.
     out_dir
         Root output directory; the campaign directory is
         ``out_dir / campaign``.
@@ -219,6 +232,7 @@ class BatchSpec:
     variants: tuple[Variant, ...]
     devices: tuple[int, ...] | None
     distance_bins: tuple[float, ...]
+    prefetch: int
     out_dir: Path
     source_path: Path | None
     raw: Mapping[str, Any]
@@ -299,6 +313,8 @@ class BatchSpec:
 
         distance_bins = _parse_distance_bins(raw.get("distance_bins", []))
 
+        prefetch = _parse_prefetch(raw.get("prefetch", 1))
+
         out_dir = Path(str(raw.get("out_dir", "results")))
 
         variants = _expand_variants(
@@ -317,6 +333,7 @@ class BatchSpec:
             variants=variants,
             devices=devices,
             distance_bins=distance_bins,
+            prefetch=prefetch,
             out_dir=out_dir,
             source_path=source_path,
             raw=dict(raw),
@@ -406,6 +423,16 @@ def _parse_distance_bins(value: Any) -> tuple[float, ...]:
     if list(edges) != sorted(edges):
         raise ValueError(f"'distance_bins' must be non-decreasing, got {value!r}")
     return edges
+
+
+def _parse_prefetch(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"'prefetch' must be a non-negative int, got {value!r}")
+    if value < 0:
+        raise ValueError(f"'prefetch' must be a non-negative int, got {value!r}")
+    return int(value)
 
 
 # ------------------------------------------------------- variant expansion

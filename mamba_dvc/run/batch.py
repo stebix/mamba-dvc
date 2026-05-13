@@ -22,6 +22,36 @@ Two deliberate deviations from the plan's §5 sketch:
   The real fix — non-pinned host staging in ``gpu.dispatch`` — is
   tracked separately (plan §9 deferrals); a bare same-args retry is
   omitted because a deterministic OOM just fails twice as slowly.
+
+Prefetch pipeline
+-----------------
+``load_pair`` is the campaign's single biggest cost (the full
+``(960, 1280, 1280)`` reference + deformed + mask + GT flow is ~30 GB of
+zarr reads — hundreds of seconds, comparable to the whole correlate +
+evaluate cost of the load group it feeds). The materialize-once design
+already amortizes one load over a group's compute-tier variants;
+:func:`_prefetched_load_groups` additionally overlaps the *next* group's
+``load_pair`` with the *current* group's variant loop, using a single
+background thread. The variant loop is dominated by GIL-releasing work
+(GPU dispatch blocked on worker processes, large NumPy reductions like
+the summed-area-table build), so the loader thread runs largely
+unimpeded even though ``load_pair`` itself holds the GIL a fair fraction
+of the time — measured overlap efficiency against a NumPy-heavy consumer
+is ~1.9x (≈ perfect); only a pathological pure-Python consumer would
+drag it toward 1.0x. Depth is :attr:`BatchSpec.prefetch` (0 disables);
+the prefetch is skipped step-by-step when free host RAM would not
+comfortably hold another materialized pair (``psutil``-based; a no-op
+without ``psutil``, which is safe on a host whose RAM dwarfs a pair).
+Results are bit-identical with prefetch on or off — only *when*
+``load_pair`` runs changes, and a failed load is still recorded as a
+per-job ``load_pair`` failure, just observed one group later.
+
+Effect on timing instrumentation: the ``batch.load_pair`` records (see
+:mod:`mamba_dvc.instrument`) are emitted from the loader thread when
+prefetch is on, so their accumulated total is the real wall time spent
+loading but no longer all on the campaign's critical path — read it as
+"how much I/O happened", not "how much I/O cost the wall clock". The
+``dispatch.*`` / ``ncc.*`` / ``evaluate.*`` phases are unaffected.
 """
 
 from __future__ import annotations
@@ -35,7 +65,9 @@ import subprocess
 import time
 import traceback
 import warnings
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,12 +76,13 @@ from typing import Any, cast
 import numpy as np
 
 from mamba_dvc.gpu.dispatch import correlate_multi_gpu
+from mamba_dvc.instrument import timed
 from mamba_dvc.io.dataset import NO_MASK, DvcDataset, EvaluationPair
 from mamba_dvc.io.manifest import StoreManifest
 from mamba_dvc.run.config import BatchSpec, Variant, knob_names, slug_value
 from mamba_dvc.run.progress import BatchObserver, NullObserver
 from mamba_dvc.types import DisplacementField, POIStatus
-from mamba_dvc.validate.known_fields import ErrorReport, evaluate_pair
+from mamba_dvc.validate.known_fields import BoundaryDistanceIndex, ErrorReport, evaluate_pair
 
 __all__ = ["DatasetOpener", "Job", "JobResult", "plan_jobs", "run_batch"]
 
@@ -250,6 +283,13 @@ def run_batch(
     ``correlate``, ``evaluate``, or write) is recorded and the run
     continues.
 
+    When ``spec.prefetch >= 1`` (the default is ``1``) the next
+    ``(deformation, mask, dry_shape)`` group's ``load_pair`` runs in a
+    background thread while the current group's variants are processed —
+    results are bit-identical, only the wall-clock schedule (and the
+    timing of :meth:`~mamba_dvc.run.progress.BatchObserver.on_pair_load_start`)
+    changes. See the module docstring ("Prefetch pipeline").
+
     Parameters
     ----------
     spec
@@ -336,33 +376,65 @@ def run_batch(
                     _record(_failed(job, "open_store", tb))
                 continue
 
-            # Group by (deformation, mask, dry_shape) → one load_pair each.
-            for load_key, load_jobs in _group_by(conv_jobs, _load_group_key):
-                deformation, mask_sel, dry_shape = load_key
-                obs.on_pair_load_start(task.store, deformation, n_variants=len(load_jobs))
-                try:
-                    pair = ds.load_pair(
-                        deformation,
-                        mask=_mask_selector(mask_sel),
-                        dry_shape=dry_shape,
-                    )
-                except Exception:
-                    tb = traceback.format_exc()
+            # Group by (deformation, mask, dry_shape) → one load_pair each,
+            # with the next group's load overlapping the current group's
+            # variant loop in a background thread (see the module docstring,
+            # "Prefetch pipeline"). ``spec.prefetch == 0`` keeps it purely
+            # synchronous.
+            load_groups = _group_by(conv_jobs, _load_group_key)
+            pair_bytes_hint = _estimate_pair_bytes(ds)
+
+            def _announce(
+                load_key: Any, jobs: list[Job], *, _store: Path = task.store
+            ) -> None:
+                obs.on_pair_load_start(_store, load_key[0], n_variants=len(jobs))
+
+            for load_jobs, pair, load_error in _prefetched_load_groups(
+                ds,
+                load_groups,
+                depth=spec.prefetch,
+                pair_bytes_hint=pair_bytes_hint,
+                announce_load=_announce,
+            ):
+                if load_error is not None:
                     for job in load_jobs:
                         obs.on_job_start(job)
-                        _record(_failed(job, "load_pair", tb))
+                        _record(_failed(job, "load_pair", load_error))
                     continue
+                assert pair is not None  # load_error is None ⇒ the pair materialized
 
                 truth_cache: dict[tuple[Any, ...], np.ndarray] = {}
+                # The mask (hence its boundary distances) is identical across
+                # every compute-tier variant of this pair; build the index
+                # once here and let _run_variant reuse it. Only when it will
+                # actually be used: real entries have no GT, an empty
+                # distance_bins skips the table.
+                boundary_index = (
+                    BoundaryDistanceIndex.from_mask(pair.mask)
+                    if pair.gt_field is not None
+                    and pair.mask is not None
+                    and len(spec.distance_bins) > 0
+                    else None
+                )
                 # Sort by grid params so adjacent variants reuse the cache.
                 for job in sorted(load_jobs, key=lambda j: _grid_key(j.variant)):
                     obs.on_job_start(job)
                     _record(
-                        _run_variant(spec, pair, job, correlate, truth_cache, campaign_dir)
+                        _run_variant(
+                            spec,
+                            pair,
+                            job,
+                            correlate,
+                            truth_cache,
+                            boundary_index,
+                            campaign_dir,
+                        )
                     )
 
                 # The materialized pair is ~30 GB on production volumes;
-                # release it before the next load_pair (plan §6).
+                # release the consumed one before moving on (plan §6).
+                # Prefetched-but-not-yet-consumed pairs are held by their
+                # futures inside _prefetched_load_groups, separate from this.
                 del pair
                 gc.collect()
 
@@ -377,6 +449,7 @@ def _run_variant(
     job: Job,
     correlate: _CorrelateFn,
     truth_cache: dict[tuple[Any, ...], np.ndarray],
+    boundary_index: BoundaryDistanceIndex | None,
     campaign_dir: Path,
 ) -> JobResult:
     """Correlate → (evaluate) → persist one variant against a materialized pair."""
@@ -396,11 +469,16 @@ def _run_variant(
             te0 = time.perf_counter()
             gk = _grid_key(variant)
             if gk not in truth_cache:
-                truth_cache[gk] = np.ascontiguousarray(
-                    pair.gt_field(field.positions), dtype=np.float32
-                )
+                with timed("batch.gt_resample", n_poi=int(field.positions.shape[0])):
+                    truth_cache[gk] = np.ascontiguousarray(
+                        pair.gt_field(field.positions), dtype=np.float32
+                    )
             report = evaluate_pair(
-                pair, field, distance_bins=spec.distance_bins, truth=truth_cache[gk]
+                pair,
+                field,
+                distance_bins=spec.distance_bins,
+                truth=truth_cache[gk],
+                boundary_index=boundary_index,
             )
             wall_evaluate = time.perf_counter() - te0
 
@@ -450,6 +528,170 @@ def _correlate_with_fallback(
                 pair.reference, pair.deformed, mask=pair.mask, device_ids=devices[:2], **kwargs
             )
         raise
+
+
+# ----------------------------------------------------------------- prefetch
+
+# A materialized ``EvaluationPair`` for the full production volume is
+# ~30 GB of host RAM; the prefetch RAM guard is loosened by this factor
+# (i.e. it wants ``resident_pairs`` pairs to fit within free / 1.25).
+_PREFETCH_RAM_SAFETY: float = 1.25
+
+# What ``_load_or_capture`` returns (and a ``Future`` of it carries):
+# the materialized pair, or ``None`` plus a formatted traceback.
+_LoadOutcome = tuple[EvaluationPair | None, str | None]
+
+
+def _estimate_pair_bytes(ds: DvcDataset) -> int:
+    """Rough host-RAM footprint of one materialized :class:`EvaluationPair`.
+
+    Counts reference (float32) + deformed (float32) + mask (bool) + GT
+    flow (3 x float32) over the store's *full* volume shape — an upper
+    bound (a ``dry_shape`` variant, or a maskless / real entry, uses
+    less). Used only to size the prefetch RAM guard, so over-estimating
+    is the safe direction. Returns ``0`` when the shape is unknown (a
+    duck-typed dataset without ``volume_shape``, e.g. in tests), which
+    the guard reads as "don't restrict prefetch".
+    """
+    shape = getattr(ds, "volume_shape", None)
+    if shape is None:
+        return 0
+    voxels = 1
+    for axis in shape:
+        voxels *= int(axis)
+    bytes_per_voxel = 4 + 4 + 1 + 3 * 4  # ref + def + mask + flow
+    return voxels * bytes_per_voxel
+
+
+def _available_ram_bytes() -> int | None:
+    """Free host RAM in bytes, or ``None`` when ``psutil`` is unavailable."""
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover - psutil is normally installed
+        return None
+    return int(psutil.virtual_memory().available)
+
+
+def _prefetch_ram_fits(pair_bytes_hint: int, *, resident_pairs: int) -> bool:
+    """Whether free host RAM comfortably holds ``resident_pairs`` materialized pairs.
+
+    ``resident_pairs`` is the peak count alive at once if one more
+    prefetch were queued: the pairs already in flight, plus the new one,
+    plus the one the consumer currently holds. Returns ``True`` (don't
+    throttle prefetch) when the hint is unusable or ``psutil`` is
+    missing — safe on the workstation this targets, where 255 GB of RAM
+    dwarfs a ~30 GB pair.
+    """
+    if pair_bytes_hint <= 0:
+        return True
+    available = _available_ram_bytes()
+    if available is None:
+        return True
+    return available > pair_bytes_hint * resident_pairs * _PREFETCH_RAM_SAFETY
+
+
+def _load_or_capture(ds: DvcDataset, load_key: Any) -> _LoadOutcome:
+    """Materialize one pair for ``load_key``, capturing any failure as a traceback.
+
+    Returns ``(pair, None)`` on success or ``(None, traceback_str)`` on
+    failure — so a load raised inside the prefetch thread surfaces as a
+    recordable per-group error in the consumer instead of propagating
+    out of the worker and aborting the campaign. Wrapped in a
+    ``timed("batch.load_pair")`` block; when prefetch is on this runs in
+    the loader thread (the recorded duration is the load's wall time, no
+    longer all on the campaign's critical path — see the module
+    docstring).
+    """
+    deformation, mask_sel, dry_shape = load_key
+    try:
+        with timed("batch.load_pair", deformation=deformation):
+            pair = ds.load_pair(
+                deformation, mask=_mask_selector(mask_sel), dry_shape=dry_shape
+            )
+    except Exception:
+        return None, traceback.format_exc()
+    return pair, None
+
+
+def _prefetched_load_groups(
+    ds: DvcDataset,
+    groups: Sequence[tuple[Any, list[Job]]],
+    *,
+    depth: int,
+    pair_bytes_hint: int,
+    announce_load: Callable[[Any, list[Job]], None],
+) -> Iterator[tuple[list[Job], EvaluationPair | None, str | None]]:
+    """Yield ``(jobs, pair, error_tb)`` per load group, loading ahead.
+
+    With ``depth <= 0`` this is a plain synchronous generator: each pair
+    is loaded immediately before it is yielded. With ``depth >= 1`` a
+    single background thread runs ``ds.load_pair`` for upcoming groups
+    while the consumer drives correlate/evaluate on the current one, so
+    the next group's zarr read overlaps the current group's variant loop
+    (which is dominated by GIL-releasing work, so the loader thread runs
+    largely unimpeded). At most ``depth`` loads are queued ahead of the
+    consumer, and only one runs at a time — more loader threads would
+    just thrash the disk and multiply the host-RAM footprint. Before
+    queuing another load the free host RAM is checked against
+    ``pair_bytes_hint`` (:func:`_prefetch_ram_fits`); if it would not
+    comfortably hold one more materialized pair, the prefetch is skipped
+    for that step and the load happens synchronously when the consumer
+    reaches it — prefetch never risks an OOM to go faster.
+
+    ``announce_load(load_key, jobs)`` is called (on the consumer's
+    thread) at the moment this generator is about to *use* a group's
+    pair: just before the synchronous load, or — when prefetched — just
+    before the result is awaited (so a renderer's "loading pair…" state
+    coincides with a real wait when the consumer has outpaced the loader,
+    and is a brief flash otherwise). It is the hook
+    :func:`run_batch` wires to ``BatchObserver.on_pair_load_start``.
+
+    A load that raises is yielded as ``(jobs, None, traceback)`` and the
+    iterator does not stop; the consumer records that group's jobs as
+    ``load_pair`` failures and moves on — the same outcome as the
+    pre-prefetch synchronous path, just one group later.
+
+    Ctrl-C note: a ``load_pair`` already running in the loader thread
+    cannot be interrupted, so aborting a campaign mid-load waits for that
+    one load to finish before the process exits.
+    """
+    if depth <= 0:
+        for load_key, jobs in groups:
+            announce_load(load_key, jobs)
+            pair, err = _load_or_capture(ds, load_key)
+            yield jobs, pair, err
+        return
+
+    n = len(groups)
+    # Each entry: (load_key, jobs, Future yielding the load outcome).
+    in_flight: deque[tuple[Any, list[Job], Future[_LoadOutcome]]] = deque()
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mdvc-load") as pool:
+        next_idx = 0
+
+        def _fill() -> None:
+            nonlocal next_idx
+            # Keep up to ``depth + 1`` loads outstanding: one for the group
+            # the consumer is about to take, ``depth`` more loading behind
+            # its back. Always submit the very first (nothing to balance
+            # against); for the rest, hold off if host RAM looks tight —
+            # a skipped slot just means a synchronous load later.
+            while next_idx < n and len(in_flight) < depth + 1:
+                if in_flight and not _prefetch_ram_fits(
+                    pair_bytes_hint, resident_pairs=len(in_flight) + 2
+                ):
+                    break
+                load_key, jobs = groups[next_idx]
+                in_flight.append((load_key, jobs, pool.submit(_load_or_capture, ds, load_key)))
+                next_idx += 1
+
+        _fill()
+        while in_flight:
+            load_key, jobs, future = in_flight.popleft()
+            announce_load(load_key, jobs)
+            pair, err = future.result()  # blocks iff this load has not finished yet
+            _fill()  # queue the next load so it runs during the consumer's work below
+            yield jobs, pair, err
 
 
 # ----------------------------------------------------------------- grouping
