@@ -25,6 +25,7 @@ into the parent's full-length buffers.
 
 from __future__ import annotations
 
+import time
 import warnings
 from typing import Literal
 
@@ -34,6 +35,7 @@ from jaxtyping import Bool, Float32
 from mamba_dvc.core.grid import build_grid, filter_by_mask
 from mamba_dvc.core.outlier import detect_outliers
 from mamba_dvc.gpu.budget import BudgetInputs, is_cupy_available, recommend_batch_size
+from mamba_dvc.instrument import log_phase, timed
 from mamba_dvc.pipeline._internal import (
     TUKEY_DEFAULTS,
     NCCMode,
@@ -207,16 +209,20 @@ def correlate(
         int(reference.shape[2]),
     )
 
-    grid = build_grid(volume_shape, window=win, overlap=overlap)
+    t_total = time.perf_counter()
+
+    with timed("correlate.build_grid"):
+        grid = build_grid(volume_shape, window=win, overlap=overlap)
     n_points = int(np.prod(grid.grid_shape))
 
-    effective_mask, effective_def_mask = resolve_masks(mask, deformed_mask, volume_shape)
+    with timed("correlate.resolve_masks"):
+        effective_mask, effective_def_mask = resolve_masks(mask, deformed_mask, volume_shape)
 
-    admitted = (
-        filter_by_mask(grid, effective_mask, mask_threshold)
-        if mask is not None
-        else np.ones(n_points, dtype=np.bool_)
-    )
+    if mask is not None:
+        with timed("correlate.filter_by_mask", n_points=n_points):
+            admitted = filter_by_mask(grid, effective_mask, mask_threshold)
+    else:
+        admitted = np.ones(n_points, dtype=np.bool_)
     admitted_idx = np.flatnonzero(admitted).astype(np.int64)
 
     # Resolve "auto" via :mod:`mamba_dvc.gpu.budget`. Probes device 0
@@ -246,34 +252,46 @@ def correlate(
     else:
         resolved_batch = batch_size
 
-    displacements, confidence, status = correlate_admitted_subset(
-        reference,
-        deformed,
-        effective_mask,
-        effective_def_mask,
-        grid,
-        admitted_idx,
-        search_radius=search_radius,
+    with timed(
+        "correlate.ncc",
+        n_admitted=int(admitted_idx.shape[0]),
         batch_size=resolved_batch,
-        eps=eps,
-        ncc_mode=ncc_mode,
-        ncc_normalization=ncc_normalization,
-        tukey_alpha=resolved_tukey,
-    )
+    ):
+        displacements, confidence, status = correlate_admitted_subset(
+            reference,
+            deformed,
+            effective_mask,
+            effective_def_mask,
+            grid,
+            admitted_idx,
+            search_radius=search_radius,
+            batch_size=resolved_batch,
+            eps=eps,
+            ncc_mode=ncc_mode,
+            ncc_normalization=ncc_normalization,
+            tukey_alpha=resolved_tukey,
+        )
 
     # Outlier rejection (plan §2 step 7). Run after the search-radius
     # gate (folded into the helper) so out-of-range POIs do not
     # participate in any neighborhood; the precedence MASKED ->
     # OUT_OF_RANGE -> OUTLIER preserves the original failure mode for
     # diagnostic stratification.
-    valid_pre = status == POIStatus.OK
-    outlier_flag = detect_outliers(grid, displacements, valid_pre)
-    status[outlier_flag] = POIStatus.OUTLIER
-    displacements[outlier_flag] = 0.0
-    confidence[outlier_flag] = 0.0
+    with timed("correlate.outlier"):
+        valid_pre = status == POIStatus.OK
+        outlier_flag = detect_outliers(grid, displacements, valid_pre)
+        status[outlier_flag] = POIStatus.OUTLIER
+        displacements[outlier_flag] = 0.0
+        confidence[outlier_flag] = 0.0
 
     valid = status == POIStatus.OK
 
+    log_phase(
+        "correlate.total",
+        time.perf_counter() - t_total,
+        n_points=n_points,
+        n_admitted=int(admitted_idx.shape[0]),
+    )
     return DisplacementField(
         positions=grid.positions,
         displacements=displacements,

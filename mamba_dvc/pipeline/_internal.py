@@ -46,6 +46,7 @@ from mamba_dvc.core.ncc import NCCMode, NCCNormalization, peak_displacement
 from mamba_dvc.core.ncc import correlate as correlate_ncc
 from mamba_dvc.core.peakfit import gaussian_subvoxel_fit
 from mamba_dvc.core.window import preprocess_subvolumes
+from mamba_dvc.instrument import PhaseTimer
 from mamba_dvc.types import GridSpec, POIStatus
 
 try:
@@ -276,30 +277,42 @@ def correlate_admitted_subset(
     status[admitted_idx] = int(POIStatus.OK)
 
     n_admitted = int(admitted_idx.shape[0])
+    # Per-sub-phase wall time accumulated across batches and flushed once
+    # (mamba_dvc.instrument). ``sync`` only when running on CuPy, so the
+    # GPU sub-phase numbers reflect kernel execution rather than launch;
+    # both are no-ops unless the timing logger is enabled.
+    pt = PhaseTimer(sync=xp is not np)
     for batch_start in range(0, n_admitted, batch_size):
         batch_slice = admitted_idx[batch_start : batch_start + batch_size]
         chunk = grid.starts[batch_slice]
 
-        ref_sv = extract_subvolumes(reference, chunk, grid.window)
-        def_sv = extract_subvolumes(deformed, chunk, grid.window)
-        mref_sv = extract_subvolumes(mask, chunk, grid.window)
-        mdef_sv = extract_subvolumes(deformed_mask, chunk, grid.window)
+        with pt("ncc.extract"):
+            ref_sv = extract_subvolumes(reference, chunk, grid.window)
+            def_sv = extract_subvolumes(deformed, chunk, grid.window)
+            mref_sv = extract_subvolumes(mask, chunk, grid.window)
+            mdef_sv = extract_subvolumes(deformed_mask, chunk, grid.window)
 
-        ref_pp = preprocess_subvolumes(ref_sv, mref_sv, tukey_alpha=tukey_alpha)
-        def_pp = preprocess_subvolumes(def_sv, mdef_sv, tukey_alpha=tukey_alpha)
+        with pt("ncc.preprocess"):
+            ref_pp = preprocess_subvolumes(ref_sv, mref_sv, tukey_alpha=tukey_alpha)
+            def_pp = preprocess_subvolumes(def_sv, mdef_sv, tukey_alpha=tukey_alpha)
 
-        corr = correlate_ncc(
-            ref_pp,
-            def_pp,
-            mode=ncc_mode,
-            normalization=ncc_normalization,
-            eps=eps,
-        )
-        integer, peak = peak_displacement(corr)
-        fractional = gaussian_subvoxel_fit(corr, integer)
+        with pt("ncc.correlate"):
+            corr = correlate_ncc(
+                ref_pp,
+                def_pp,
+                mode=ncc_mode,
+                normalization=ncc_normalization,
+                eps=eps,
+            )
+
+        with pt("ncc.peakfit"):
+            integer, peak = peak_displacement(corr)
+            fractional = gaussian_subvoxel_fit(corr, integer)
 
         displacements[batch_slice] = integer.astype(xp.float32) + fractional
         confidence[batch_slice] = peak
+
+    pt.flush(n_batches=(n_admitted + batch_size - 1) // batch_size, n_admitted=n_admitted)
 
     # search_radius enforcement on the shard's POIs only. integer-peak
     # magnitude is what determines whether the lag is unambiguous; the

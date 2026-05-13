@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import sys
+import time
 import traceback
 from collections.abc import Sequence
 from contextlib import suppress
@@ -60,6 +61,7 @@ from mamba_dvc.gpu.budget import (
     resident_bytes,
 )
 from mamba_dvc.gpu.shm import SharedArrayHandle, attach, published
+from mamba_dvc.instrument import log_phase, timed
 from mamba_dvc.pipeline._internal import (
     TUKEY_DEFAULTS,
     NCCMode,
@@ -238,24 +240,33 @@ def _run_helper_on_device(
     caller.
     """
     assert _cp is not None  # guarded by caller
-    ref_dev = _cp.asarray(reference)
-    def_dev = _cp.asarray(deformed)
-    mask_dev = _cp.asarray(mask)
-    def_mask_dev = _cp.asarray(deformed_mask)
+    with timed("dispatch.h2d", sync=True):
+        ref_dev = _cp.asarray(reference)
+        def_dev = _cp.asarray(deformed)
+        mask_dev = _cp.asarray(mask)
+        def_mask_dev = _cp.asarray(deformed_mask)
     grid_dev, admitted_dev = _to_device(grid, admitted_idx)
 
-    disp_dev, conf_dev, stat_dev = correlate_admitted_subset(
-        ref_dev,
-        def_dev,
-        mask_dev,
-        def_mask_dev,
-        grid_dev,
-        admitted_dev,
-        **helper_kwargs,
-    )
+    # ``sync=True`` on the helper block: the inner batched loop only
+    # launches kernels, so without an exit sync this would measure launch
+    # time, not compute. The sync drains the device queue at the seam --
+    # the same drain ``cp.asnumpy`` does below, just attributed here.
+    with timed("dispatch.helper", sync=True):
+        disp_dev, conf_dev, stat_dev = correlate_admitted_subset(
+            ref_dev,
+            def_dev,
+            mask_dev,
+            def_mask_dev,
+            grid_dev,
+            admitted_dev,
+            **helper_kwargs,
+        )
     # `cp.asnumpy` is a synchronization point -- it forces the device
-    # work queue to drain before we touch the host buffers.
-    return _cp.asnumpy(disp_dev), _cp.asnumpy(conf_dev), _cp.asnumpy(stat_dev)
+    # work queue to drain before we touch the host buffers (already drained
+    # by the helper block's exit sync, so this measures just the D2H copy).
+    with timed("dispatch.d2h", sync=True):
+        result = (_cp.asnumpy(disp_dev), _cp.asnumpy(conf_dev), _cp.asnumpy(stat_dev))
+    return result
 
 
 def _worker_entry(
@@ -584,28 +595,35 @@ def correlate_multi_gpu(
         int(reference.shape[2]),
     )
 
-    grid = build_grid(volume_shape, window=win, overlap=overlap)
+    t_total = time.perf_counter()
+
+    with timed("dispatch.build_grid"):
+        grid = build_grid(volume_shape, window=win, overlap=overlap)
     n_points = int(np.prod(grid.grid_shape))
 
-    eff_mask, eff_def_mask = resolve_masks(mask, deformed_mask, volume_shape)
+    with timed("dispatch.resolve_masks"):
+        eff_mask, eff_def_mask = resolve_masks(mask, deformed_mask, volume_shape)
 
-    admitted = (
-        filter_by_mask(grid, eff_mask, mask_threshold)
-        if mask is not None
-        else np.ones(n_points, dtype=np.bool_)
-    )
+    if mask is not None:
+        with timed("dispatch.filter_by_mask", n_points=n_points):
+            admitted = filter_by_mask(grid, eff_mask, mask_threshold)
+    else:
+        admitted = np.ones(n_points, dtype=np.bool_)
     admitted_idx = np.flatnonzero(admitted).astype(np.int64)
 
     # Volumes / masks must be C-contiguous to publish into shared
-    # memory without an extra copy on the worker side.
-    reference_c = np.ascontiguousarray(reference)
-    deformed_c = np.ascontiguousarray(deformed)
-    eff_mask_c = np.ascontiguousarray(eff_mask)
-    # When deformed_mask falls back to mask, ascontiguousarray returns
-    # the same object -- avoid publishing the same buffer twice.
-    eff_def_mask_c = (
-        eff_mask_c if eff_def_mask is eff_mask else np.ascontiguousarray(eff_def_mask)
-    )
+    # memory without an extra copy on the worker side. This is the
+    # ~30 GB host-side materialisation flagged in
+    # ``docs/plans/general-perf-improvements.md`` R3.
+    with timed("dispatch.materialize_contiguous"):
+        reference_c = np.ascontiguousarray(reference)
+        deformed_c = np.ascontiguousarray(deformed)
+        eff_mask_c = np.ascontiguousarray(eff_mask)
+        # When deformed_mask falls back to mask, ascontiguousarray returns
+        # the same object -- avoid publishing the same buffer twice.
+        eff_def_mask_c = (
+            eff_mask_c if eff_def_mask is eff_mask else np.ascontiguousarray(eff_def_mask)
+        )
 
     resolved_device_ids = _resolve_device_ids(device_ids)
 
@@ -634,45 +652,59 @@ def correlate_multi_gpu(
         "tukey_alpha": resolved_tukey,
     }
 
-    if len(resolved_device_ids) == 1:
-        displacements, confidence, status = _run_single_process(
-            reference_c,
-            deformed_c,
-            eff_mask_c,
-            eff_def_mask_c,
-            grid,
-            admitted_idx,
-            resolved_device_ids[0],
-            helper_kwargs,
-        )
-    else:
-        # When mask falls back, dispatch publishes the same buffer
-        # twice (once as 'mask', once as 'deformed_mask'). That is
-        # fine -- workers attach by name and read; the duplicate is a
-        # rounding error against the 1.6 GB mask itself.
-        displacements, confidence, status = _run_multi_process(
-            reference_c,
-            deformed_c,
-            eff_mask_c,
-            eff_def_mask_c,
-            grid,
-            admitted_idx,
-            resolved_device_ids,
-            helper_kwargs,
-        )
+    with timed(
+        "dispatch.compute",
+        n_devices=len(resolved_device_ids),
+        n_admitted=int(admitted_idx.shape[0]),
+        batch_size=resolved_batch,
+    ):
+        if len(resolved_device_ids) == 1:
+            displacements, confidence, status = _run_single_process(
+                reference_c,
+                deformed_c,
+                eff_mask_c,
+                eff_def_mask_c,
+                grid,
+                admitted_idx,
+                resolved_device_ids[0],
+                helper_kwargs,
+            )
+        else:
+            # When mask falls back, dispatch publishes the same buffer
+            # twice (once as 'mask', once as 'deformed_mask'). That is
+            # fine -- workers attach by name and read; the duplicate is a
+            # rounding error against the 1.6 GB mask itself.
+            displacements, confidence, status = _run_multi_process(
+                reference_c,
+                deformed_c,
+                eff_mask_c,
+                eff_def_mask_c,
+                grid,
+                admitted_idx,
+                resolved_device_ids,
+                helper_kwargs,
+            )
 
     # Outlier rejection on the assembled lattice. This is the step
     # that REQUIRES a single host-side sweep; running it inside a
     # worker would see a 3x3x3 neighborhood with cross-shard slots
     # masked out and produce false positives at the slab boundaries.
-    valid_pre = status == POIStatus.OK
-    outlier_flag = detect_outliers(grid, displacements, valid_pre)
-    status[outlier_flag] = POIStatus.OUTLIER
-    displacements[outlier_flag] = 0.0
-    confidence[outlier_flag] = 0.0
+    with timed("dispatch.outlier"):
+        valid_pre = status == POIStatus.OK
+        outlier_flag = detect_outliers(grid, displacements, valid_pre)
+        status[outlier_flag] = POIStatus.OUTLIER
+        displacements[outlier_flag] = 0.0
+        confidence[outlier_flag] = 0.0
 
     valid = status == POIStatus.OK
 
+    log_phase(
+        "dispatch.total",
+        time.perf_counter() - t_total,
+        n_points=n_points,
+        n_admitted=int(admitted_idx.shape[0]),
+        n_devices=len(resolved_device_ids),
+    )
     return DisplacementField(
         positions=grid.positions,
         displacements=displacements,
