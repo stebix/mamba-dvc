@@ -15,14 +15,23 @@ carry the meanings above.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
 from jaxtyping import Bool, Float32, Int64, UInt8
 
-__all__ = ["DisplacementField", "GridSpec", "POIStatus", "PhysicalUnit", "VoxelSpacing"]
+__all__ = [
+    "DisplacementField",
+    "DisplacementSeries",
+    "GridSpec",
+    "POIStatus",
+    "PairingStrategy",
+    "PhysicalUnit",
+    "SeriesPairStatus",
+    "VoxelSpacing",
+]
 
 
 PhysicalUnit = Literal["voxel", "nm", "um", "mm"]
@@ -270,3 +279,181 @@ class VoxelSpacing:
             raise ValueError(f"values must have length 3, got {len(self.values)}")
         if any(v <= 0.0 for v in self.values):
             raise ValueError(f"values entries must be positive, got {self.values}")
+
+
+class PairingStrategy(StrEnum):
+    """Pairing topology for the time-series driver.
+
+    The driver applies one of these strategies to an iterator of
+    ``(t, frame)`` tuples, producing a sequence of ``DisplacementField``
+    results — one per pair. The string values double as CLI flag
+    names; do not rename without checking ``mamba_dvc.cli``.
+
+    Members
+    -------
+    REFERENCE_ANCHORED
+        Each pair is ``(frame_0, frame_t)``. The recovered field is the
+        absolute displacement at ``t`` (Lagrangian total). Per-frame
+        errors are independent; no temporal drift. Search-radius
+        pressure grows with ``t``.
+    SEQUENTIAL
+        Each pair is ``(frame_{t-1}, frame_t)``. The recovered field is
+        incremental. Cumulative displacements require composition (see
+        :meth:`DisplacementSeries.cumulative`); errors random-walk.
+        Search-radius pressure stays bounded by inter-frame motion.
+    UPDATED_REFERENCE
+        Reserved for v2 warm-start (anchored to frame 0 but the deformed
+        frame is pre-warped by the previous cumulative estimate so the
+        correlator sees only the residual). The driver accepts this
+        value to keep the enum stable; it raises ``NotImplementedError``
+        until the v2 warper lands.
+    """
+
+    REFERENCE_ANCHORED = "reference_anchored"
+    SEQUENTIAL = "sequential"
+    UPDATED_REFERENCE = "updated_reference"
+
+
+class SeriesPairStatus(IntEnum):
+    """Per-pair outcome recorded in :attr:`DisplacementSeries.pair_status`.
+
+    Members
+    -------
+    OK
+        Pair completed normally; the corresponding
+        :class:`DisplacementField` carries its real result.
+    FAILED
+        The single-pair correlator raised an exception (e.g. CUDA OOM,
+        propagated worker exception). The slot holds a zero-filled
+        field with every POI ``POIStatus.MASKED``; downstream cumulative
+        composition halts at the first such boundary.
+    """
+
+    OK = 0
+    FAILED = 1
+
+
+@dataclass(frozen=True)
+class DisplacementSeries:
+    """Ordered DVC results across an iterator of frames.
+
+    All entries share :attr:`grid` (built once at series start). Any
+    per-frame metadata that varies — timestamps, file paths, status —
+    lives on this dataclass, not duplicated into each
+    :class:`DisplacementField`. The container is ``frozen=True``;
+    consumers cache :meth:`cumulative` if they need the composed
+    sequence twice.
+
+    Parameters
+    ----------
+    fields
+        Per-pair :class:`DisplacementField` results, one per pair in
+        ``pair_indices``. Failed pairs carry a zero-filled
+        :class:`DisplacementField`; rely on :attr:`pair_status` rather
+        than :attr:`DisplacementField.valid` to detect them.
+    pair_indices
+        ``(pairs, 2)`` int64 array of ``(t_ref, t_def)`` per pair. The
+        integers come straight from the iterator the driver consumed —
+        unitless frame indices, not timestamps.
+    pair_status
+        ``(pairs,)`` uint8 :class:`SeriesPairStatus` per pair.
+    grid
+        Lattice descriptor built once from the first frame's shape and
+        the requested window / overlap. Every entry in :attr:`fields`
+        uses this grid.
+    strategy
+        Pairing topology that produced :attr:`pair_indices`. Drives the
+        semantics of :meth:`cumulative`.
+    timestamps
+        Optional caller-supplied wall-clock timestamps aligned with
+        :attr:`pair_indices` (``len == pairs``). Carried as metadata
+        for downstream plotting; the driver itself never reads them.
+
+    Notes
+    -----
+    The "fields are already absolute" semantics for
+    :data:`PairingStrategy.REFERENCE_ANCHORED` and "fields are
+    incremental" semantics for :data:`PairingStrategy.SEQUENTIAL` are
+    interpreted by :meth:`cumulative`; the dataclass itself stores
+    whatever the driver produced.
+    """
+
+    fields: tuple[DisplacementField, ...]
+    pair_indices: Int64[np.ndarray, "pairs 2"]
+    pair_status: UInt8[np.ndarray, "pairs"]
+    grid: GridSpec
+    strategy: PairingStrategy
+    timestamps: tuple[float, ...] | None = None
+
+    def cumulative(
+        self,
+        *,
+        interpolation: Literal["linear", "cubic"] = "linear",
+    ) -> tuple[DisplacementField, ...]:
+        """Materialize the absolute (cumulative) displacement field at each pair.
+
+        For :data:`PairingStrategy.REFERENCE_ANCHORED`, each entry in
+        :attr:`fields` is already an absolute displacement; the method
+        returns the OK-prefix of :attr:`fields` as a tuple.
+
+        For :data:`PairingStrategy.SEQUENTIAL`, each entry is an
+        increment between consecutive frames; the method chains them
+        via :func:`mamba_dvc.core.field_ops.compose_displacement_fields`
+        to produce the absolute field at each cumulative step.
+        Composition halts at the first
+        :data:`SeriesPairStatus.FAILED` boundary — the returned tuple
+        is shorter than :attr:`fields` when a pair failed.
+
+        Parameters
+        ----------
+        interpolation
+            Interpolation order for the semi-Lagrangian sample inside
+            :func:`compose_displacement_fields`. ``"linear"`` is the
+            default and matches the small-displacement regime; switch
+            to ``"cubic"`` when per-step displacements approach the
+            grid spacing.
+
+        Returns
+        -------
+        tuple of DisplacementField
+            Length equals the number of consecutive ``OK`` pairs from
+            the start of the series. Empty if the first pair failed.
+
+        Raises
+        ------
+        NotImplementedError
+            If :attr:`strategy` is
+            :data:`PairingStrategy.UPDATED_REFERENCE` (reserved for v2).
+        """
+        if self.strategy is PairingStrategy.UPDATED_REFERENCE:
+            raise NotImplementedError(
+                "cumulative() is not defined for PairingStrategy.UPDATED_REFERENCE"
+                " — that strategy is reserved for v2."
+            )
+
+        # OK-prefix of the series: stop at the first FAILED entry.
+        ok_prefix: list[DisplacementField] = []
+        for field, status in zip(self.fields, self.pair_status, strict=True):
+            if int(status) != int(SeriesPairStatus.OK):
+                break
+            ok_prefix.append(field)
+
+        if not ok_prefix:
+            return ()
+
+        if self.strategy is PairingStrategy.REFERENCE_ANCHORED:
+            # Each pair already encodes the absolute displacement vs frame 0.
+            return tuple(ok_prefix)
+
+        # SEQUENTIAL — fold from the left via semi-Lagrangian composition.
+        # Local import: ``core.field_ops`` imports ``DisplacementField`` from
+        # this module, so deferring the import here avoids the cycle while
+        # keeping the method ergonomic to call.
+        from mamba_dvc.core.field_ops import compose_displacement_fields
+
+        out: list[DisplacementField] = [ok_prefix[0]]
+        for increment in ok_prefix[1:]:
+            out.append(
+                compose_displacement_fields(out[-1], increment, interpolation=interpolation)
+            )
+        return tuple(out)
