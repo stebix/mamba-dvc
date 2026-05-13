@@ -483,13 +483,16 @@ class TestMultiGPUDispatcherValidation:
         with pytest.raises(RuntimeError, match="with block"):
             d.correlate(ref, ref)
 
-    def test_is_multiprocess_reflects_device_count(self):
-        single = MultiGPUDispatcher(device_ids=[0], volume_shape=(16, 16, 16), window=8)
-        # ``is_multiprocess`` is False until __enter__ runs; the
-        # property nonetheless reports the resolved state so a caller
-        # can inspect it after entering. Here we just confirm the
-        # default-False semantics.
-        assert single.is_multiprocess is False
+    def test_post_open_properties_unavailable_before_enter(self):
+        # ``device_ids`` and ``is_multiprocess`` derive from CuPy's
+        # device-visibility view, which is only consulted at __enter__.
+        # Accessing them pre-open is a programmer error -- pin that
+        # contract so callers don't get a silent empty-tuple sentinel.
+        d = MultiGPUDispatcher(device_ids=[0], volume_shape=(16, 16, 16), window=8)
+        with pytest.raises(RuntimeError, match="with block"):
+            _ = d.is_multiprocess
+        with pytest.raises(RuntimeError, match="with block"):
+            _ = d.device_ids
 
 
 @pytest.mark.gpu

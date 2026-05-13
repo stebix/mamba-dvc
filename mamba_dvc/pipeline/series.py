@@ -188,10 +188,9 @@ def correlate_series(
     # host-only ``correlate()``. The branch lives outside the per-pair
     # try/except so the dispatcher's per-pair RuntimeError is caught
     # alongside any other failure mode.
-    use_dispatcher = dispatcher is not None
     anchored_via_dispatcher = (
-        use_dispatcher
-        and dispatcher.has_anchored_reference  # pyright: ignore[reportOptionalMemberAccess]
+        dispatcher is not None
+        and dispatcher.has_anchored_reference
         and strategy is PairingStrategy.REFERENCE_ANCHORED
     )
 
@@ -205,8 +204,7 @@ def correlate_series(
         # isolation is the buildout-doc contract. KeyboardInterrupt /
         # SystemExit derive from BaseException and bypass this branch.
         try:
-            if use_dispatcher:
-                assert dispatcher is not None  # narrowed by use_dispatcher
+            if dispatcher is not None:
                 ref_arg = None if anchored_via_dispatcher else reference
                 field = dispatcher.correlate(ref_arg, deformed)
             else:

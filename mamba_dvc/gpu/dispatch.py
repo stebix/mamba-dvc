@@ -224,6 +224,92 @@ def _to_device(grid: GridSpec, admitted_idx: np.ndarray) -> tuple[GridSpec, Any]
     return grid_dev, admitted_dev
 
 
+def _validate_correlator_kwargs(
+    batch_size: int | Literal["auto"],
+    ncc_mode: NCCMode,
+    ncc_normalization: NCCNormalization,
+    window: int | tuple[int, int, int],
+    search_radius: int | None,
+) -> tuple[NCCMode, NCCNormalization, tuple[int, int, int], int]:
+    """Normalize the per-pair correlator kwargs shared by every entry point.
+
+    Returns the coerced ``(ncc_mode, ncc_normalization, window, search_radius)``;
+    raises :class:`ValueError` on any malformed input. ``batch_size`` is
+    validated in-place (the resolved value depends on caller context --
+    "auto" goes through :func:`_resolve_auto_batch` later -- so we
+    don't return a normalized batch from here).
+    """
+    if isinstance(batch_size, int):
+        if batch_size <= 0:
+            raise ValueError(
+                f"batch_size must be a positive int or 'auto', got {batch_size!r}"
+            )
+    elif batch_size != "auto":
+        raise ValueError(f"batch_size must be a positive int or 'auto', got {batch_size!r}")
+
+    try:
+        ncc_mode = NCCMode(ncc_mode)
+    except ValueError as exc:
+        raise ValueError(
+            f"ncc_mode must be one of {[m.value for m in NCCMode]}, got {ncc_mode!r}"
+        ) from exc
+    try:
+        ncc_normalization = NCCNormalization(ncc_normalization)
+    except ValueError as exc:
+        raise ValueError(
+            f"ncc_normalization must be one of {[m.value for m in NCCNormalization]}, "
+            f"got {ncc_normalization!r}"
+        ) from exc
+
+    win = normalize_window(window)
+    resolved_search_radius = min(win) // 2 if search_radius is None else int(search_radius)
+    if resolved_search_radius <= 0:
+        raise ValueError(f"search_radius must be positive, got {resolved_search_radius}")
+
+    return ncc_mode, ncc_normalization, win, resolved_search_radius
+
+
+def _release_shm(shm: Any) -> None:
+    """Close and unlink a :class:`SharedMemory` block, swallowing teardown errors.
+
+    The dispatcher publishes the mask + optional anchored reference
+    for its full lifetime and the deformed (+ optional reference) per
+    pair. Every release site wants the same paired ``close()`` /
+    ``unlink()`` with errors suppressed -- the second call on a block
+    that the resource tracker already removed is benign on Windows and
+    a no-op on POSIX. ``None`` is accepted so callers can release
+    "maybe-published" slots unconditionally.
+    """
+    if shm is None:
+        return
+    with suppress(Exception):
+        shm.close()
+    with suppress(OSError):
+        shm.unlink()
+
+
+def _apply_outlier_rejection(
+    grid: GridSpec,
+    displacements: np.ndarray,
+    confidence: np.ndarray,
+    status: np.ndarray,
+) -> np.ndarray:
+    """Run the host-side outlier test and zero out flagged POIs.
+
+    Mutates ``displacements``, ``confidence``, and ``status`` in place;
+    returns the resulting ``valid`` mask. This step REQUIRES the
+    assembled lattice -- running it inside a worker on a per-shard
+    partial would see a 3x3x3 neighborhood with cross-shard slots
+    masked out and produce false positives at the slab boundaries.
+    """
+    valid_pre = status == POIStatus.OK
+    outlier_flag = detect_outliers(grid, displacements, valid_pre)
+    status[outlier_flag] = POIStatus.OUTLIER
+    displacements[outlier_flag] = 0.0
+    confidence[outlier_flag] = 0.0
+    return status == POIStatus.OK
+
+
 def _run_helper_on_device(
     reference: Float32[np.ndarray, "z y x"],
     deformed: Float32[np.ndarray, "z y x"],
@@ -557,36 +643,10 @@ def correlate_multi_gpu(
         )
     if reference.ndim != 3:
         raise ValueError(f"reference must be 3D, got ndim={reference.ndim}")
-    # ``Literal["auto"]`` widens batch_size to ``int | str`` at runtime;
-    # split the validation so the int branch keeps the existing
-    # positivity guard and the string branch only accepts "auto".
-    if isinstance(batch_size, int):
-        if batch_size <= 0:
-            raise ValueError(
-                f"batch_size must be a positive int or 'auto', got {batch_size!r}"
-            )
-    elif batch_size != "auto":
-        raise ValueError(f"batch_size must be a positive int or 'auto', got {batch_size!r}")
 
-    win = normalize_window(window)
-    if search_radius is None:
-        search_radius = min(win) // 2
-    if search_radius <= 0:
-        raise ValueError(f"search_radius must be positive, got {search_radius}")
-    try:
-        ncc_mode = NCCMode(ncc_mode)
-    except ValueError as exc:
-        raise ValueError(
-            f"ncc_mode must be one of {[m.value for m in NCCMode]}, got {ncc_mode!r}"
-        ) from exc
-    try:
-        ncc_normalization = NCCNormalization(ncc_normalization)
-    except ValueError as exc:
-        raise ValueError(
-            f"ncc_normalization must be one of {[m.value for m in NCCNormalization]}, "
-            f"got {ncc_normalization!r}"
-        ) from exc
-
+    ncc_mode, ncc_normalization, win, search_radius = _validate_correlator_kwargs(
+        batch_size, ncc_mode, ncc_normalization, window, search_radius
+    )
     resolved_tukey = TUKEY_DEFAULTS[ncc_mode] if tukey_alpha is None else tukey_alpha
 
     volume_shape: tuple[int, int, int] = (
@@ -685,18 +745,8 @@ def correlate_multi_gpu(
                 helper_kwargs,
             )
 
-    # Outlier rejection on the assembled lattice. This is the step
-    # that REQUIRES a single host-side sweep; running it inside a
-    # worker would see a 3x3x3 neighborhood with cross-shard slots
-    # masked out and produce false positives at the slab boundaries.
     with timed("dispatch.outlier"):
-        valid_pre = status == POIStatus.OK
-        outlier_flag = detect_outliers(grid, displacements, valid_pre)
-        status[outlier_flag] = POIStatus.OUTLIER
-        displacements[outlier_flag] = 0.0
-        confidence[outlier_flag] = 0.0
-
-    valid = status == POIStatus.OK
+        valid = _apply_outlier_rejection(grid, displacements, confidence, status)
 
     log_phase(
         "dispatch.total",
@@ -758,6 +808,17 @@ def _serve_worker(
     loop failures send a single ``("err", ...)`` and exit; per-pair
     failures send ``("err", ...)`` and continue serving so the parent
     can surface a single pair failure without tearing down the pool.
+
+    Notes
+    -----
+    The CuPy default memory pool is deliberately NOT freed between
+    pairs. Every pair shares identically-shaped scratch buffers (mask,
+    grid, batch FFT workspaces) because window / overlap / batch_size
+    are bound at dispatcher startup; retaining the pool lets the next
+    pair reuse those allocations instead of paying a fresh malloc /
+    cuFFT-plan cost. If a future caller starts varying shapes mid-
+    series, this worker contract changes (release between pairs) and
+    the dispatcher's ``__enter__`` will need to forbid that variation.
     """
     resident_shm: list[Any] = []
     try:
@@ -1031,34 +1092,9 @@ class MultiGPUDispatcher:
                     f"anchored_reference must be float32, got {anchored_reference.dtype}"
                 )
 
-        if isinstance(batch_size, int):
-            if batch_size <= 0:
-                raise ValueError(
-                    f"batch_size must be a positive int or 'auto', got {batch_size!r}"
-                )
-        elif batch_size != "auto":
-            raise ValueError(
-                f"batch_size must be a positive int or 'auto', got {batch_size!r}"
-            )
-
-        try:
-            ncc_mode = NCCMode(ncc_mode)
-        except ValueError as exc:
-            raise ValueError(
-                f"ncc_mode must be one of {[m.value for m in NCCMode]}, got {ncc_mode!r}"
-            ) from exc
-        try:
-            ncc_normalization = NCCNormalization(ncc_normalization)
-        except ValueError as exc:
-            raise ValueError(
-                f"ncc_normalization must be one of {[m.value for m in NCCNormalization]}, "
-                f"got {ncc_normalization!r}"
-            ) from exc
-
-        win = normalize_window(window)
-        resolved_search_radius = min(win) // 2 if search_radius is None else int(search_radius)
-        if resolved_search_radius <= 0:
-            raise ValueError(f"search_radius must be positive, got {resolved_search_radius}")
+        ncc_mode, ncc_normalization, win, resolved_search_radius = _validate_correlator_kwargs(
+            batch_size, ncc_mode, ncc_normalization, window, search_radius
+        )
 
         self._device_ids_arg = device_ids
         self._mask = mask
@@ -1086,15 +1122,20 @@ class MultiGPUDispatcher:
         self._shards_idx: list[np.ndarray] = []
         self._effective_mask_c: np.ndarray | None = None
         self._anchored_reference_c: np.ndarray | None = None
+        # Per-pair merged buffers (allocated once at __enter__, reset per pair).
+        self._merged_disp: np.ndarray | None = None
+        self._merged_conf: np.ndarray | None = None
+        self._merged_stat: np.ndarray | None = None
         # Multi-process plumbing:
         self._workers: list[Any] = []
         self._send_pipes: list[Connection] = []
         self._recv_pipes: list[Connection] = []
         self._mask_shm_obj: Any = None
         self._anch_shm_obj: Any = None
-        # In-process plumbing:
+        # In-process plumbing (deformed mask shares the reference mask
+        # buffer in v1; a separate slot lands when per-frame deformed
+        # masks become a real feature).
         self._inproc_mask_dev: Any = None
-        self._inproc_def_mask_dev: Any = None
         self._inproc_anchored_dev: Any = None
         self._inproc_grid_dev: GridSpec | None = None
         self._inproc_admitted_dev: Any = None
@@ -1111,12 +1152,30 @@ class MultiGPUDispatcher:
 
     @property
     def device_ids(self) -> tuple[int, ...]:
-        """Resolved device ids; only meaningful after :meth:`__enter__`."""
+        """Resolved device ids.
+
+        Raises :class:`RuntimeError` if accessed before :meth:`__enter__` --
+        the resolved list depends on CuPy's view of visible devices, which
+        is only consulted at open time.
+        """
+        if not self._opened:
+            raise RuntimeError(
+                "MultiGPUDispatcher.device_ids is only available inside the with block"
+            )
         return tuple(self._device_ids)
 
     @property
     def is_multiprocess(self) -> bool:
-        """Whether the dispatcher will spawn workers (``len(device_ids) > 1``)."""
+        """Whether the dispatcher spawned workers (``len(device_ids) > 1``).
+
+        Raises :class:`RuntimeError` before :meth:`__enter__`; the
+        routing decision is made at open time once ``device_ids`` is
+        resolved.
+        """
+        if not self._opened:
+            raise RuntimeError(
+                "MultiGPUDispatcher.is_multiprocess is only available inside the with block"
+            )
         return self._is_multiprocess
 
     def __enter__(self) -> "MultiGPUDispatcher":
@@ -1177,6 +1236,14 @@ class MultiGPUDispatcher:
         if self._anchored_reference is not None:
             self._anchored_reference_c = np.ascontiguousarray(self._anchored_reference)
 
+        # Allocate the merged-result buffers once for the dispatcher's
+        # lifetime; ``_dispatch_pair_mp`` resets the slots each pair via
+        # ``.fill(...)`` instead of reallocating ~3 arrays of length
+        # n_points every call.
+        self._merged_disp = np.zeros((n_points, 3), dtype=np.float32)
+        self._merged_conf = np.zeros(n_points, dtype=np.float32)
+        self._merged_stat = np.full(n_points, POIStatus.MASKED, dtype=np.uint8)
+
         try:
             if len(self._device_ids) == 1:
                 self._is_multiprocess = False
@@ -1205,7 +1272,6 @@ class MultiGPUDispatcher:
         device_id = self._device_ids[0]
         with _cp.cuda.Device(device_id):
             self._inproc_mask_dev = _cp.asarray(self._effective_mask_c)
-            self._inproc_def_mask_dev = self._inproc_mask_dev
             if self._anchored_reference_c is not None:
                 self._inproc_anchored_dev = _cp.asarray(self._anchored_reference_c)
             grid_dev, admitted_dev = _to_device(self._grid, self._admitted_idx)
@@ -1294,7 +1360,6 @@ class MultiGPUDispatcher:
     def _exit_inproc(self) -> None:
         """Release in-process device references; CuPy pool reclaims memory."""
         self._inproc_mask_dev = None
-        self._inproc_def_mask_dev = None
         self._inproc_anchored_dev = None
         self._inproc_grid_dev = None
         self._inproc_admitted_dev = None
@@ -1319,21 +1384,16 @@ class MultiGPUDispatcher:
 
     def _cleanup_state(self) -> None:
         """Unpublish SHM and clear plumbing state. Idempotent."""
-        if self._mask_shm_obj is not None:
-            with suppress(Exception):
-                self._mask_shm_obj.close()
-            with suppress(OSError):
-                self._mask_shm_obj.unlink()
-            self._mask_shm_obj = None
-        if self._anch_shm_obj is not None:
-            with suppress(Exception):
-                self._anch_shm_obj.close()
-            with suppress(OSError):
-                self._anch_shm_obj.unlink()
-            self._anch_shm_obj = None
+        _release_shm(self._mask_shm_obj)
+        _release_shm(self._anch_shm_obj)
+        self._mask_shm_obj = None
+        self._anch_shm_obj = None
         self._workers = []
         self._send_pipes = []
         self._recv_pipes = []
+        self._merged_disp = None
+        self._merged_conf = None
+        self._merged_stat = None
 
     def correlate(
         self,
@@ -1399,15 +1459,8 @@ class MultiGPUDispatcher:
         else:
             disp, conf, stat = self._dispatch_pair_inproc(reference_c, deformed_c)
 
-        # Outlier rejection on the assembled lattice -- same step the
-        # one-shot ``correlate_multi_gpu`` runs at the parent.
         assert self._grid is not None
-        valid_pre = stat == POIStatus.OK
-        outlier_flag = detect_outliers(self._grid, disp, valid_pre)
-        stat[outlier_flag] = POIStatus.OUTLIER
-        disp[outlier_flag] = 0.0
-        conf[outlier_flag] = 0.0
-        valid = stat == POIStatus.OK
+        valid = _apply_outlier_rejection(self._grid, disp, conf, stat)
 
         return DisplacementField(
             positions=self._grid.positions,
@@ -1426,8 +1479,6 @@ class MultiGPUDispatcher:
         deformed_c: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         assert _cp is not None
-        # All ``_inproc_*_dev`` slots are populated by :meth:`_enter_inproc`,
-        # so the dispatcher is guaranteed to be in a usable state here.
         assert self._inproc_grid_dev is not None
         device_id = self._device_ids[0]
         with _cp.cuda.Device(device_id):
@@ -1445,7 +1496,7 @@ class MultiGPUDispatcher:
                 ref_dev,
                 def_dev,
                 self._inproc_mask_dev,
-                self._inproc_def_mask_dev,
+                self._inproc_mask_dev,  # v1: deformed_mask reuses mask
                 self._inproc_grid_dev,
                 self._inproc_admitted_dev,
                 **self._helper_kwargs,
@@ -1461,10 +1512,16 @@ class MultiGPUDispatcher:
         reference_c: np.ndarray | None,
         deformed_c: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        n_points = self._n_points
-        merged_disp = np.zeros((n_points, 3), dtype=np.float32)
-        merged_conf = np.zeros(n_points, dtype=np.float32)
-        merged_stat = np.full(n_points, POIStatus.MASKED, dtype=np.uint8)
+        # Reset the per-pair merged buffers (allocated once at __enter__).
+        assert self._merged_disp is not None
+        assert self._merged_conf is not None
+        assert self._merged_stat is not None
+        merged_disp = self._merged_disp
+        merged_conf = self._merged_conf
+        merged_stat = self._merged_stat
+        merged_disp.fill(0.0)
+        merged_conf.fill(0.0)
+        merged_stat.fill(POIStatus.MASKED)
 
         # Per-pair SHM lifetime: bracket the publish around send + gather.
         def_shm_obj, def_handle = publish(deformed_c)
@@ -1514,14 +1571,7 @@ class MultiGPUDispatcher:
             if errors:
                 raise RuntimeError("MultiGPUDispatcher pair failed:\n" + "\n".join(errors))
         finally:
-            with suppress(Exception):
-                def_shm_obj.close()
-            with suppress(OSError):
-                def_shm_obj.unlink()
-            if ref_shm_obj is not None:
-                with suppress(Exception):
-                    ref_shm_obj.close()
-                with suppress(OSError):
-                    ref_shm_obj.unlink()
+            _release_shm(def_shm_obj)
+            _release_shm(ref_shm_obj)
 
         return merged_disp, merged_conf, merged_stat
