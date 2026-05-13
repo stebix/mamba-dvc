@@ -12,6 +12,8 @@ Plan: ``docs/plans/run-interface.md`` §1, §5.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Annotated
@@ -33,7 +35,18 @@ from rich.table import Table
 from rich.text import Text
 
 from mamba_dvc.instrument import accumulating
-from mamba_dvc.run import BatchSpec, Job, JobResult, NullObserver, plan_jobs, run_batch
+from mamba_dvc.run import (
+    BatchObserver,
+    BatchSpec,
+    EventSink,
+    Job,
+    JobResult,
+    NullObserver,
+    StructlogObserver,
+    Tee,
+    plan_jobs,
+    run_batch,
+)
 
 __all__ = ["run"]
 
@@ -158,6 +171,17 @@ def run(
         bool,
         typer.Option("--no-color", help="Disable styled terminal output."),
     ] = False,
+    no_events: Annotated[
+        bool,
+        typer.Option(
+            "--no-events",
+            help=(
+                "Disable the per-campaign events.jsonl event stream. By default a "
+                "JSONL log of lifecycle events, phase records, and warnings is "
+                "written alongside the campaign results."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Execute (or preview, with ``--dry-run``) a batch campaign config.
 
@@ -200,6 +224,7 @@ def run(
                     stores=store_subset,
                     console=console,
                     quiet=quiet,
+                    no_events=no_events,
                 )
             timing_table = acc.render(
                 title="campaign phase breakdown — wall seconds (sub-phases nest under totals)"
@@ -212,6 +237,7 @@ def run(
                 stores=store_subset,
                 console=console,
                 quiet=quiet,
+                no_events=no_events,
             )
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -234,6 +260,7 @@ def _execute_campaign(
     stores: list[Path] | None,
     console: Console,
     quiet: bool,
+    no_events: bool,
 ) -> list[JobResult]:
     """Run the campaign, picking a progress observer for the output target.
 
@@ -242,21 +269,60 @@ def _execute_campaign(
     spinner/progress bar. The ``run_batch`` return value and the on-disk
     artifacts are identical in every case — only the live rendering
     differs (the library itself stays print-free).
+
+    Unless ``no_events``, an :class:`EventSink` wraps the run and tees
+    its :class:`StructlogObserver` with the chosen renderer, so a single
+    ``events.jsonl`` captures lifecycle hooks, phase records, and
+    warnings on the same JSON substrate (see
+    :mod:`mamba_dvc.run.eventlog`).
     """
-    if quiet:
-        return run_batch(spec, force=force, only=only, stores=stores, observer=NullObserver())
-    if not console.is_terminal:
-        return run_batch(
-            spec, force=force, only=only, stores=stores, observer=_PlainLogObserver(console)
-        )
-    with _campaign_progress(console) as progress:
-        return run_batch(
-            spec,
-            force=force,
-            only=only,
-            stores=stores,
-            observer=_RichProgressObserver(progress),
-        )
+    with _events_sink(spec, enabled=not no_events) as struct_obs:
+        if quiet:
+            return run_batch(
+                spec,
+                force=force,
+                only=only,
+                stores=stores,
+                observer=_compose(NullObserver(), struct_obs),
+            )
+        if not console.is_terminal:
+            return run_batch(
+                spec,
+                force=force,
+                only=only,
+                stores=stores,
+                observer=_compose(_PlainLogObserver(console), struct_obs),
+            )
+        with _campaign_progress(console) as progress:
+            return run_batch(
+                spec,
+                force=force,
+                only=only,
+                stores=stores,
+                observer=_compose(_RichProgressObserver(progress), struct_obs),
+            )
+
+
+@contextmanager
+def _events_sink(spec: BatchSpec, *, enabled: bool) -> Generator[StructlogObserver | None]:
+    """Open an :class:`EventSink` for the campaign, or yield ``None`` when disabled.
+
+    Keeps the conditional out of :func:`_execute_campaign`'s observer-selection
+    branches: either branch tees with the yielded observer (when set) or
+    runs with the renderer alone (when ``--no-events`` is in effect).
+    """
+    if not enabled:
+        yield None
+        return
+    with EventSink(spec.campaign_dir, campaign=spec.campaign) as observer:
+        yield observer
+
+
+def _compose(renderer: BatchObserver, struct_obs: StructlogObserver | None) -> BatchObserver:
+    """Tee a renderer with the structlog observer, or return the renderer alone."""
+    if struct_obs is None:
+        return renderer
+    return Tee(renderer, struct_obs)
 
 
 # ----------------------------------------------------------------- rendering
