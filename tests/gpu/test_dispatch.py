@@ -17,7 +17,11 @@ from typing import Any
 import numpy as np
 import pytest
 from mamba_dvc.core.grid import build_grid
-from mamba_dvc.gpu.dispatch import _shard_admitted_indices, correlate_multi_gpu
+from mamba_dvc.gpu.dispatch import (
+    MultiGPUDispatcher,
+    _shard_admitted_indices,
+    correlate_multi_gpu,
+)
 from mamba_dvc.pipeline.correlate import correlate
 from mamba_dvc.types import POIStatus
 from mamba_dvc.validate.synthetic import make_pair, rigid_shift
@@ -408,3 +412,187 @@ class TestAutoBatchResolution:
         assert captured["helper_kwargs"]["batch_size"] == 64
         # No structured log line either.
         assert "auto." not in capsys.readouterr().err
+
+
+class TestMultiGPUDispatcherValidation:
+    """Constructor + property tests that need no GPU.
+
+    The :class:`MultiGPUDispatcher` constructor is deliberately
+    side-effect free: it validates shapes/dtypes/kwargs and stores
+    config, but does not import CuPy or touch a device. The work that
+    needs a GPU happens in :meth:`__enter__`. These tests pin that
+    contract.
+    """
+
+    def test_requires_some_way_to_infer_shape(self):
+        with pytest.raises(ValueError, match="volume_shape"):
+            MultiGPUDispatcher(device_ids=[0])
+
+    def test_volume_shape_inferred_from_mask(self):
+        mask = np.ones((32, 24, 24), dtype=np.bool_)
+        d = MultiGPUDispatcher(device_ids=[0], mask=mask, window=16)
+        assert d.volume_shape == (32, 24, 24)
+        assert not d.has_anchored_reference
+
+    def test_volume_shape_inferred_from_anchored_reference(self):
+        ref = np.zeros((24, 24, 24), dtype=np.float32)
+        d = MultiGPUDispatcher(device_ids=[0], anchored_reference=ref, window=16)
+        assert d.volume_shape == (24, 24, 24)
+        assert d.has_anchored_reference
+
+    def test_volume_shape_must_match_supplied_mask(self):
+        mask = np.ones((32, 32, 32), dtype=np.bool_)
+        with pytest.raises(ValueError, match="mask shape"):
+            MultiGPUDispatcher(device_ids=[0], mask=mask, volume_shape=(16, 16, 16), window=8)
+
+    def test_mask_dtype_must_be_bool(self):
+        mask = np.ones((32, 32, 32), dtype=np.uint8)
+        with pytest.raises(ValueError, match="bool"):
+            MultiGPUDispatcher(device_ids=[0], mask=mask, window=16)  # type: ignore[arg-type]
+
+    def test_anchored_reference_dtype_must_be_float32(self):
+        ref = np.zeros((32, 32, 32), dtype=np.float64)
+        with pytest.raises(ValueError, match="float32"):
+            MultiGPUDispatcher(
+                device_ids=[0],
+                anchored_reference=ref,
+                window=16,  # type: ignore[arg-type]
+            )
+
+    def test_zero_int_batch_size_rejected(self):
+        with pytest.raises(ValueError, match="positive int or 'auto'"):
+            MultiGPUDispatcher(
+                device_ids=[0],
+                volume_shape=(32, 32, 32),
+                window=16,
+                batch_size=0,
+            )
+
+    def test_unknown_string_batch_size_rejected(self):
+        with pytest.raises(ValueError, match="positive int or 'auto'"):
+            MultiGPUDispatcher(
+                device_ids=[0],
+                volume_shape=(32, 32, 32),
+                window=16,
+                batch_size="big",  # type: ignore[arg-type]
+            )
+
+    def test_correlate_outside_context_raises(self):
+        d = MultiGPUDispatcher(device_ids=[0], volume_shape=(16, 16, 16), window=8)
+        ref = np.zeros((16, 16, 16), dtype=np.float32)
+        with pytest.raises(RuntimeError, match="with block"):
+            d.correlate(ref, ref)
+
+    def test_is_multiprocess_reflects_device_count(self):
+        single = MultiGPUDispatcher(device_ids=[0], volume_shape=(16, 16, 16), window=8)
+        # ``is_multiprocess`` is False until __enter__ runs; the
+        # property nonetheless reports the resolved state so a caller
+        # can inspect it after entering. Here we just confirm the
+        # default-False semantics.
+        assert single.is_multiprocess is False
+
+
+@pytest.mark.gpu
+class TestMultiGPUDispatcherInProcess:
+    """End-to-end tests for the single-device in-process dispatcher path.
+
+    Routes through the same ``correlate_admitted_subset`` helper as
+    :func:`correlate_multi_gpu`, so the results must match the
+    one-shot shim within float32 noise on identical inputs.
+    """
+
+    @staticmethod
+    def _smooth_pair(
+        shape: tuple[int, int, int] = (48, 48, 48),
+        shift: tuple[float, float, float] = (0.4, -0.6, 0.9),
+        seed: int = 17,
+    ):
+        pair = make_pair(shape=shape, field=rigid_shift(shift), seed=seed)
+        return pair.reference, pair.deformed
+
+    @pytest.mark.slow
+    def test_single_device_open_close_skips_spawn(self):
+        # Buildout doc S10 ``TestEnterExitNoSpawn``: opening a
+        # dispatcher with one device must not create a ``mp.Process``.
+        # We patch the spawn context's ``Process`` factory to fail loudly
+        # if it gets called.
+        from mamba_dvc.gpu import dispatch as dispatch_mod
+
+        ref, _deformed = self._smooth_pair()
+        ctx = dispatch_mod.mp.get_context("spawn")
+
+        class _NoSpawn:
+            def Process(self, *args: Any, **kwargs: Any) -> Any:  # noqa: N802
+                raise AssertionError("single-device MultiGPUDispatcher must not spawn workers")
+
+            def Pipe(self, *args: Any, **kwargs: Any) -> Any:  # noqa: N802
+                return ctx.Pipe(*args, **kwargs)
+
+        # mp.get_context is called inside _enter_multiprocess only.
+        # Patching at module level guarantees the multi-process path
+        # would be detected even if the routing decision regressed.
+        with pytest.MonkeyPatch.context() as mp_ctx:
+            mp_ctx.setattr(dispatch_mod.mp, "get_context", lambda _name: _NoSpawn())
+            with MultiGPUDispatcher(
+                device_ids=[0],
+                anchored_reference=ref,
+                window=24,
+                overlap=0.5,
+                search_radius=8,
+            ) as d:
+                assert d.is_multiprocess is False
+                assert d.device_ids == (0,)
+
+    @pytest.mark.slow
+    def test_single_device_matches_correlate_multi_gpu(self):
+        ref, deformed = self._smooth_pair()
+        kwargs = dict(window=24, overlap=0.5, search_radius=8, batch_size=64)
+
+        shim_field = correlate_multi_gpu(ref, deformed, device_ids=[0], **kwargs)
+
+        with MultiGPUDispatcher(
+            device_ids=[0],
+            volume_shape=ref.shape,
+            **kwargs,
+        ) as d:
+            disp_field = d.correlate(ref, deformed)
+
+        _assert_fields_match(shim_field, disp_field)
+
+    @pytest.mark.slow
+    def test_anchored_reference_path_matches_explicit_reference(self):
+        # Passing ``reference=None`` against the resident anchored ref
+        # must yield bit-identical (within float32 noise) results to
+        # passing the same reference explicitly.
+        ref, deformed = self._smooth_pair()
+        kwargs = dict(window=24, overlap=0.5, search_radius=8, batch_size=64)
+
+        with MultiGPUDispatcher(
+            device_ids=[0],
+            anchored_reference=ref,
+            **kwargs,
+        ) as d:
+            anchored_field = d.correlate(None, deformed)
+            explicit_field = d.correlate(ref, deformed)
+
+        _assert_fields_match(anchored_field, explicit_field)
+
+    @pytest.mark.slow
+    def test_repeated_pairs_keep_workers_alive(self):
+        # Same dispatcher, three pairs. Each .correlate() call must
+        # succeed and the device_ids tuple must not change between
+        # calls (the workers / in-process context are reused).
+        ref, _ = self._smooth_pair(shift=(0.0, 0.0, 0.0))
+        kwargs = dict(window=24, overlap=0.5, search_radius=8, batch_size=64)
+
+        with MultiGPUDispatcher(
+            device_ids=[0],
+            anchored_reference=ref,
+            **kwargs,
+        ) as d:
+            ids_before = d.device_ids
+            for shift in ((0.3, 0.0, 0.0), (-0.4, 0.5, 0.0), (0.0, -0.6, 0.7)):
+                _, deformed = self._smooth_pair(shift=shift)
+                field = d.correlate(None, deformed)
+                assert field.displacements.shape[1] == 3
+            assert d.device_ids == ids_before
