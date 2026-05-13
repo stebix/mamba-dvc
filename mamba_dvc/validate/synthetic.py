@@ -38,6 +38,9 @@ than pre-sampled arrays so the ground truth at any POI center is exact
 
 from __future__ import annotations
 
+import inspect
+import itertools
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
@@ -52,14 +55,20 @@ WarpConvention = Literal["pull_back", "push_forward"]
 __all__ = [
     "DisplacementFunction",
     "SyntheticPair",
+    "SyntheticSeries",
+    "TemporalDisplacementFunction",
     "WarpConvention",
     "compose",
+    "linear_motion",
     "make_pair",
+    "make_series",
     "make_texture",
+    "normalize_temporal_form",
     "rigid_shift",
     "sample_on_grid",
     "simple_shear",
     "sinusoidal",
+    "temporal_from_curried",
     "uniform_dilation",
     "warp",
 ]
@@ -488,5 +497,322 @@ def make_pair(
         reference=reference_arr,
         deformed=deformed,
         field=field,
+        mask=mask,
+    )
+
+
+@runtime_checkable
+class TemporalDisplacementFunction(Protocol):
+    """Time-parameterized displacement field, evaluable at arbitrary coords.
+
+    Implementations accept a ``(points, 3)`` coordinate array in
+    ``(z, y, x)`` order plus a scalar time ``t`` and return a
+    ``(points, 3)`` displacement array in the same order. Sign
+    convention follows :class:`DisplacementFunction`: the displacement
+    is the field that :func:`warp` consumes at the given ``t``.
+
+    The canonical convention used by the time-series test bed is that
+    ``u(coords, 0)`` is the zero field — i.e. ``frame_0`` equals the
+    reference modulo cubic-spline prefilter quantization. This is not
+    enforced; analytical fields that start non-zero at ``t = 0`` are
+    legal but the consumer must understand the implications for the
+    per-pair vs. cumulative error split.
+    """
+
+    def __call__(
+        self,
+        coords: Float32[np.ndarray, "points 3"],
+        t: float,
+    ) -> Float32[np.ndarray, "points 3"]:
+        """Evaluate the field at ``coords`` at time ``t`` and return displacements."""
+        ...
+
+
+def temporal_from_curried(
+    u_of_t: Callable[[float], DisplacementFunction],
+) -> TemporalDisplacementFunction:
+    """Wrap a curried ``t -> DisplacementFunction`` into the pointwise form.
+
+    The pointwise form ``(coords, t) -> displacements`` is the canonical
+    internal representation used by :class:`TemporalDisplacementFunction`
+    and :func:`make_series`. Use this helper to adapt a closure-style
+    factory that returns a fresh :class:`DisplacementFunction` per time
+    step:
+
+    >>> u_curried = lambda t: rigid_shift((0.0, t, 0.0))
+    >>> u_temporal = temporal_from_curried(u_curried)
+    >>> u_temporal(coords, t=2.0)  # equivalent to rigid_shift((0.0, 2.0, 0.0))(coords)
+
+    Parameters
+    ----------
+    u_of_t
+        Callable taking a scalar ``t`` and returning a
+        :class:`DisplacementFunction` evaluable at that time.
+
+    Returns
+    -------
+    TemporalDisplacementFunction
+        ``(coords, t) -> displacements`` view of the same field.
+    """
+
+    def _temporal(
+        coords: Float32[np.ndarray, "points 3"], t: float
+    ) -> Float32[np.ndarray, "points 3"]:
+        return u_of_t(float(t))(coords)
+
+    return _temporal
+
+
+def linear_motion(velocity: DisplacementFunction) -> TemporalDisplacementFunction:
+    """Build a temporal field ``u(coords, t) = t * velocity(coords)``.
+
+    Scales a spatial velocity pattern
+    linearly with time. The most common shape for synthetic series
+    eval — every analytical kinematic mode in this module
+    (:func:`rigid_shift`, :func:`uniform_dilation`, :func:`simple_shear`,
+    :func:`sinusoidal`) becomes a time-evolving field by passing it
+    through :func:`linear_motion`.
+
+    Parameters
+    ----------
+    velocity
+        Spatial pattern. Interpreted as displacement-per-unit-time;
+        the units are whatever ``t`` carries in the caller's series
+        (typically integer frame index).
+
+    Returns
+    -------
+    TemporalDisplacementFunction
+        ``u(coords, t) = t * velocity(coords)``.
+    """
+
+    def _temporal(
+        coords: Float32[np.ndarray, "points 3"], t: float
+    ) -> Float32[np.ndarray, "points 3"]:
+        scaled = velocity(coords) * np.float32(t)
+        return scaled.astype(np.float32, copy=False)
+
+    return _temporal
+
+
+def normalize_temporal_form(
+    u_of_t: Callable[..., object],
+) -> TemporalDisplacementFunction:
+    """Coerce a 1-arg (curried) or 2-arg (pointwise) callable into the pointwise form.
+
+    Dispatch is by *total positional parameter count* (required +
+    defaulted). A 1-positional callable is interpreted as the curried
+    form ``t -> DisplacementFunction``; a 2-positional callable as the
+    pointwise form ``(coords, t) -> displacements``.
+
+    Known ambiguity: a pointwise function written as
+    ``def f(coords, t=0.0)`` still has 2 positional parameters and is
+    correctly identified. A curried function written with extra
+    keyword-only parameters keeps its single positional and is also
+    correctly identified. The pathological case is a curried function
+    with ``*args``; signature introspection rejects it with a
+    :class:`ValueError` rather than guessing.
+
+    Parameters
+    ----------
+    u_of_t
+        Either a :class:`TemporalDisplacementFunction` (pointwise) or
+        a ``Callable[[float], DisplacementFunction]`` (curried).
+
+    Returns
+    -------
+    TemporalDisplacementFunction
+        Pointwise form. Returned identically when ``u_of_t`` is
+        already pointwise.
+
+    Raises
+    ------
+    ValueError
+        If the positional arity is not 1 or 2, or the callable's
+        signature cannot be introspected.
+    """
+    try:
+        sig = inspect.signature(u_of_t)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "u_of_t signature is not introspectable; pass either a function with"
+            " 1 (curried) or 2 (pointwise) positional parameters, or wrap with"
+            " temporal_from_curried"
+        ) from exc
+
+    positional_kinds = (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.POSITIONAL_ONLY,
+    )
+    positional = [p for p in sig.parameters.values() if p.kind in positional_kinds]
+    has_var_positional = any(
+        p.kind is inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
+    )
+    if has_var_positional:
+        raise ValueError(
+            "u_of_t signature uses *args, which is ambiguous between curried and"
+            " pointwise forms; wrap it with temporal_from_curried to disambiguate"
+        )
+
+    n_pos = len(positional)
+    if n_pos == 1:
+        return temporal_from_curried(u_of_t)  # type: ignore[arg-type]
+    if n_pos == 2:
+        return u_of_t  # type: ignore[return-value]
+    raise ValueError(
+        f"u_of_t must take 1 (curried) or 2 (pointwise) positional arguments, got {n_pos}"
+    )
+
+
+@dataclass(frozen=True)
+class SyntheticSeries:
+    """Container for a synthesized reference + warped-frame series.
+
+    Parameters
+    ----------
+    reference
+        ``(z, y, x)`` float32 reference volume (frame at the series
+        anchor point — typically ``t = timesteps[0]``).
+    frames
+        Tuple of ``(z, y, x)`` float32 volumes, one per entry of
+        :attr:`timesteps`. ``frames[i] = warp(reference, u(·, timesteps[i]))``.
+    timesteps
+        Integer frame indices aligned with :attr:`frames`. Monotonic
+        increasing, no duplicates.
+    field_at
+        Pointwise temporal field used to synthesize :attr:`frames`.
+        Always stored in the normalized ``(coords, t) -> displacements``
+        form; downstream eval code calls it directly to evaluate GT at
+        POI centers.
+    mask
+        Optional shared validity mask carried through verbatim; this
+        module does not generate masks itself.
+    """
+
+    reference: Float32[np.ndarray, "z y x"]
+    frames: tuple[Float32[np.ndarray, "z y x"], ...]
+    timesteps: tuple[int, ...]
+    field_at: TemporalDisplacementFunction
+    mask: Bool[np.ndarray, "z y x"] | None
+
+
+def make_series(
+    shape: tuple[int, int, int],
+    u_of_t: Callable[..., object],
+    timesteps: Sequence[int],
+    *,
+    reference: Float32[np.ndarray, "z y x"] | None = None,
+    texture_sigma: float = 1.5,
+    seed: int = 0,
+    mask: Bool[np.ndarray, "z y x"] | None = None,
+    order: int = 3,
+    convention: WarpConvention = "pull_back",
+) -> SyntheticSeries:
+    """Produce ``(reference, frames, field_at, mask)`` for a time-series eval.
+
+    Time-series sibling of :func:`make_pair`. Synthesizes one warped
+    frame per entry of ``timesteps`` against a shared reference
+    volume. The reference is generated by :func:`make_texture` when
+    not supplied.
+
+    Parameters
+    ----------
+    shape
+        ``(z, y, x)`` voxel shape shared by the reference and every
+        synthesized frame.
+    u_of_t
+        Temporal displacement field. Either the pointwise form
+        ``(coords, t) -> displacements`` (canonical) or the curried
+        form ``t -> DisplacementFunction``. Dispatch is by positional
+        arity (see :func:`normalize_temporal_form`).
+    timesteps
+        Integer frame indices to synthesize. Must be non-empty,
+        monotonic increasing, and have no duplicates. The convention
+        is that ``timesteps[0]`` (typically ``0``) anchors the series:
+        ``frames[0] = warp(reference, u(·, timesteps[0]))``, which
+        equals the reference modulo cubic-spline prefilter noise when
+        ``u(·, timesteps[0])`` is the zero field.
+    reference
+        Optional pre-built reference volume. When ``None``,
+        :func:`make_texture` generates a band-limited noise reference
+        from ``shape`` + ``texture_sigma`` + ``seed``.
+    texture_sigma, seed
+        Forwarded to :func:`make_texture`; ignored when ``reference``
+        is supplied.
+    mask
+        Optional shared validity mask. Must match ``shape``.
+    order
+        Spline order for :func:`scipy.ndimage.map_coordinates` inside
+        :func:`warp`. Default ``3`` (cubic) matches :func:`make_pair`
+        — order ``1`` (trilinear) biases the subvoxel fit enough to
+        inflate the measurable error floor below ~0.2 vx and should
+        only be used for fast iteration where the absolute floor is
+        not being reported.
+    convention
+        Warp sign convention; see :func:`warp`. Default
+        ``"pull_back"``.
+
+    Returns
+    -------
+    SyntheticSeries
+        Frozen bundle with the reference, frames, timesteps, the
+        normalized pointwise field, and the optional mask.
+
+    Raises
+    ------
+    ValueError
+        If ``timesteps`` is empty, non-monotonic, or contains
+        duplicates; if ``reference`` is supplied with wrong shape or
+        dtype; if ``mask`` is supplied with the wrong shape; if
+        ``u_of_t`` cannot be dispatched.
+    """
+    if len(shape) != 3:
+        raise ValueError(f"shape must have length 3, got {shape}")
+    if mask is not None and mask.shape != shape:
+        raise ValueError(f"mask shape {mask.shape} does not match requested shape {shape}")
+
+    ts = tuple(int(t) for t in timesteps)
+    if not ts:
+        raise ValueError("timesteps must be non-empty")
+    if len(set(ts)) != len(ts):
+        raise ValueError(f"timesteps must have no duplicates, got {ts}")
+    if any(b <= a for a, b in itertools.pairwise(ts)):
+        raise ValueError(f"timesteps must be strictly increasing, got {ts}")
+
+    if reference is None:
+        reference_arr = make_texture(shape, sigma=texture_sigma, seed=seed)
+    else:
+        if reference.shape != shape:
+            raise ValueError(
+                f"reference shape {reference.shape} does not match requested shape {shape}"
+            )
+        if reference.dtype != np.float32:
+            raise ValueError(f"reference must be float32, got {reference.dtype}")
+        reference_arr = reference
+
+    temporal = normalize_temporal_form(u_of_t)
+
+    def _field_at_t(t_value: float) -> DisplacementFunction:
+        def _field(
+            coords: Float32[np.ndarray, "points 3"],
+        ) -> Float32[np.ndarray, "points 3"]:
+            return temporal(coords, t_value)
+
+        return _field
+
+    frames_out: list[Float32[np.ndarray, "z y x"]] = []
+    for t in ts:
+        # Always run the warp pipeline — including at t=0 — so every
+        # frame shares the same spectral content. Skipping the warp
+        # for the anchor frame would give frame_0 a different prefilter
+        # signature than t > 0 frames and inject a systematic NCC bias.
+        warped = warp(reference_arr, _field_at_t(float(t)), order=order, convention=convention)
+        frames_out.append(warped)
+
+    return SyntheticSeries(
+        reference=reference_arr,
+        frames=tuple(frames_out),
+        timesteps=ts,
+        field_at=temporal,
         mask=mask,
     )
