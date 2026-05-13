@@ -56,10 +56,10 @@ loading but no longer all on the campaign's critical path — read it as
 
 from __future__ import annotations
 
+import contextvars
 import gc
 import importlib.metadata
 import json
-import math
 import platform
 import subprocess
 import time
@@ -79,6 +79,7 @@ from mamba_dvc.gpu.dispatch import correlate_multi_gpu
 from mamba_dvc.instrument import timed
 from mamba_dvc.io.dataset import NO_MASK, DvcDataset, EvaluationPair
 from mamba_dvc.io.manifest import StoreManifest
+from mamba_dvc.run._jsonable import to_jsonable
 from mamba_dvc.run.config import BatchSpec, Variant, knob_names, slug_value
 from mamba_dvc.run.progress import BatchObserver, NullObserver
 from mamba_dvc.types import DisplacementField, POIStatus
@@ -395,6 +396,7 @@ def run_batch(
                 depth=spec.prefetch,
                 pair_bytes_hint=pair_bytes_hint,
                 announce_load=_announce,
+                store_name=task.store.name,
             ):
                 if load_error is not None:
                     for job in load_jobs:
@@ -590,7 +592,7 @@ def _prefetch_ram_fits(pair_bytes_hint: int, *, resident_pairs: int) -> bool:
     return available > pair_bytes_hint * resident_pairs * _PREFETCH_RAM_SAFETY
 
 
-def _load_or_capture(ds: DvcDataset, load_key: Any) -> _LoadOutcome:
+def _load_or_capture(ds: DvcDataset, load_key: Any, *, store_name: str) -> _LoadOutcome:
     """Materialize one pair for ``load_key``, capturing any failure as a traceback.
 
     Returns ``(pair, None)`` on success or ``(None, traceback_str)`` on
@@ -601,10 +603,20 @@ def _load_or_capture(ds: DvcDataset, load_key: Any) -> _LoadOutcome:
     the loader thread (the recorded duration is the load's wall time, no
     longer all on the campaign's critical path — see the module
     docstring).
+
+    ``store_name`` / ``deformation`` are passed explicitly to ``timed``
+    so the resulting phase record carries them regardless of any
+    contextvar bind timing: ``StructlogObserver.on_pair_load_start``
+    binds ``store`` on the *consumer* thread when the load is *awaited*,
+    which is after the loader future was already submitted with
+    ``copy_context()`` — so the loader-thread snapshot would otherwise
+    have no ``store`` to inherit. Mirrors the same fallback the plan
+    flagged for fields that emit before any inner bind
+    (``docs/buildout/logging-pipeline.md`` §"Threading & concurrency").
     """
     deformation, mask_sel, dry_shape = load_key
     try:
-        with timed("batch.load_pair", deformation=deformation):
+        with timed("batch.load_pair", store=store_name, deformation=deformation):
             pair = ds.load_pair(
                 deformation, mask=_mask_selector(mask_sel), dry_shape=dry_shape
             )
@@ -620,6 +632,7 @@ def _prefetched_load_groups(
     depth: int,
     pair_bytes_hint: int,
     announce_load: Callable[[Any, list[Job]], None],
+    store_name: str,
 ) -> Iterator[tuple[list[Job], EvaluationPair | None, str | None]]:
     """Yield ``(jobs, pair, error_tb)`` per load group, loading ahead.
 
@@ -658,7 +671,7 @@ def _prefetched_load_groups(
     if depth <= 0:
         for load_key, jobs in groups:
             announce_load(load_key, jobs)
-            pair, err = _load_or_capture(ds, load_key)
+            pair, err = _load_or_capture(ds, load_key, store_name=store_name)
             yield jobs, pair, err
         return
 
@@ -682,7 +695,25 @@ def _prefetched_load_groups(
                 ):
                     break
                 load_key, jobs = groups[next_idx]
-                in_flight.append((load_key, jobs, pool.submit(_load_or_capture, ds, load_key)))
+                # ``ThreadPoolExecutor`` does not auto-propagate
+                # ``contextvars`` to worker threads (bpo-34014 closed
+                # out-of-date). Wrap the call in a captured context so
+                # the consumer-thread bindings -- campaign / session_id
+                # / store / deformation set by ``StructlogObserver`` --
+                # are inherited as a true scope; otherwise phase
+                # records emitted from this loader thread by
+                # ``timed("batch.load_pair")`` would land in
+                # ``events.jsonl`` without those fields.
+                ctx = contextvars.copy_context()
+                in_flight.append(
+                    (
+                        load_key,
+                        jobs,
+                        pool.submit(
+                            ctx.run, _load_or_capture, ds, load_key, store_name=store_name
+                        ),
+                    )
+                )
                 next_idx += 1
 
         _fill()
@@ -971,7 +1002,7 @@ def _append_manifest_row(path: Path, spec: BatchSpec, jr: JobResult) -> None:
         if "phase" in jr.summary:
             row["phase"] = jr.summary["phase"]
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(_to_jsonable(row), allow_nan=False) + "\n")
+        fh.write(json.dumps(to_jsonable(row), allow_nan=False) + "\n")
 
 
 def _write_variants_index(spec: BatchSpec, campaign_dir: Path) -> None:
@@ -1042,22 +1073,7 @@ def _failed(job: Job, phase: str, error: str) -> JobResult:
     )
 
 
-def _to_jsonable(obj: Any) -> Any:
-    """Recursively coerce numpy scalars/arrays, tuples, and NaNs for JSON."""
-    if isinstance(obj, Mapping):
-        return {str(k): _to_jsonable(v) for k, v in cast("Mapping[Any, Any]", obj).items()}
-    if isinstance(obj, (list, tuple)):
-        return [_to_jsonable(v) for v in cast("Sequence[Any]", obj)]
-    if isinstance(obj, np.ndarray):
-        return [_to_jsonable(v) for v in obj.tolist()]
-    if isinstance(obj, np.generic):
-        return _to_jsonable(obj.item())
-    if isinstance(obj, float) and math.isnan(obj):
-        return None
-    return obj
-
-
 def _dump_json(path: Path, payload: Any) -> None:
     with path.open("w", encoding="utf-8") as fh:
-        json.dump(_to_jsonable(payload), fh, indent=2, allow_nan=False)
+        json.dump(to_jsonable(payload), fh, indent=2, allow_nan=False)
         fh.write("\n")

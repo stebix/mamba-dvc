@@ -31,3 +31,4 @@ repos:
           - pyyaml>=6.0
           - typer>=0.12
           - rich>=13.0
+          - structlog>=24.0

@@ -25,14 +25,18 @@ from __future__ import annotations
 
 from mamba_dvc.run.batch import Job, JobResult, plan_jobs, run_batch
 from mamba_dvc.run.config import BatchSpec, Variant
+from mamba_dvc.run.eventlog import EventSink, StructlogObserver, Tee
 from mamba_dvc.run.progress import BatchObserver, NullObserver
 
 __all__ = [
     "BatchObserver",
     "BatchSpec",
+    "EventSink",
     "Job",
     "JobResult",
     "NullObserver",
+    "StructlogObserver",
+    "Tee",
     "Variant",
     "plan_jobs",
     "run_batch",
