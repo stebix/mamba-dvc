@@ -11,7 +11,12 @@ from mamba_dvc.io.dataset import DvcDataset, EvaluationPair
 from mamba_dvc.io.field import GroundTruthField
 from mamba_dvc.io.profiles import BONE_SCREW_SYNCHROTRON_V1
 from mamba_dvc.types import DisplacementField, POIStatus
-from mamba_dvc.validate.known_fields import evaluate_pair, run_and_evaluate, sweep
+from mamba_dvc.validate.known_fields import (
+    BoundaryDistanceIndex,
+    evaluate_pair,
+    run_and_evaluate,
+    sweep,
+)
 from mamba_dvc.validate.synthetic import rigid_shift
 
 
@@ -283,6 +288,198 @@ class TestEvaluatePairPrecomputedTruth:
         field = _make_field(positions, displacements)
         with pytest.raises(ValueError, match="does not match"):
             evaluate_pair(pair, field, truth=np.zeros((1, 3), dtype=np.float32))
+
+
+def _edt_oracle(mask: np.ndarray, positions: np.ndarray) -> np.ndarray:
+    """The pre-KDTree computation: ``distance_transform_edt(~mask)`` sampled at POIs."""
+    from scipy.ndimage import distance_transform_edt
+
+    dist = np.asarray(distance_transform_edt(~mask))
+    rounded = np.clip(
+        np.round(positions).astype(np.int64),
+        a_min=0,
+        a_max=np.asarray(mask.shape, dtype=np.int64) - 1,
+    )
+    return dist[rounded[:, 0], rounded[:, 1], rounded[:, 2]].astype(np.float32)
+
+
+def _ball(shape: tuple[int, int, int], center: tuple[float, float, float], radius: float):
+    zz, yy, xx = np.ogrid[: shape[0], : shape[1], : shape[2]]
+    return (zz - center[0]) ** 2 + (yy - center[1]) ** 2 + (xx - center[2]) ** 2 <= radius**2
+
+
+class TestBoundaryDistanceIndex:
+    def _masks(self) -> list[tuple[str, np.ndarray]]:
+        slab = np.zeros((24, 20, 28), dtype=bool)
+        slab[5:14, 3:9, 10:25] = True
+        hollow = _ball((28, 28, 28), (14.0, 14.0, 14.0), 11.0) & ~_ball(
+            (28, 28, 28), (14.0, 14.0, 14.0), 6.0
+        )
+        return [
+            ("solid-ball", _ball((32, 32, 32), (16.0, 15.0, 17.0), 10.0)),
+            ("off-center-slab", slab),
+            ("hollow-shell", hollow),
+        ]
+
+    def test_reproduces_edt_for_random_points(self) -> None:
+        rng = np.random.default_rng(0)
+        for name, mask in self._masks():
+            shape = np.asarray(mask.shape)
+            # Mix of in-bounds foreground, in-bounds background, and
+            # out-of-range coords (negative and >= shape) so the clip,
+            # the on-tissue -> 0 branch, and the KDTree branch all run.
+            positions = rng.uniform(-3.0, shape + 3.0, size=(300, 3)).astype(np.float32)
+            index = BoundaryDistanceIndex.from_mask(mask)
+            got = index.query(positions)
+            expected = _edt_oracle(mask, positions)
+            np.testing.assert_allclose(got, expected, atol=1e-4, err_msg=name)
+
+    def test_foreground_center_pois_are_zero(self) -> None:
+        mask = _ball((24, 24, 24), (12.0, 12.0, 12.0), 8.0)
+        fg = np.argwhere(mask).astype(np.float32)
+        index = BoundaryDistanceIndex.from_mask(mask)
+        got = index.query(fg)
+        assert np.all(got == 0.0)
+        # ... and the EDT agrees there.
+        np.testing.assert_allclose(_edt_oracle(mask, fg), 0.0, atol=1e-6)
+
+    def test_out_of_range_pois_match_clipped_edt(self) -> None:
+        mask = _ball((20, 22, 18), (9.0, 11.0, 8.0), 6.0)
+        positions = np.array(
+            [[-5.0, -5.0, -5.0], [100.0, 100.0, 100.0], [-1.0, 10.0, 30.0]],
+            dtype=np.float32,
+        )
+        index = BoundaryDistanceIndex.from_mask(mask)
+        np.testing.assert_allclose(
+            index.query(positions), _edt_oracle(mask, positions), atol=1e-4
+        )
+
+    def test_all_true_mask_is_all_zero(self) -> None:
+        mask = np.ones((8, 8, 8), dtype=bool)
+        index = BoundaryDistanceIndex.from_mask(mask)
+        assert index.tree is None
+        positions = np.array([[2.0, 3.0, 4.0], [-1.0, 50.0, 0.0]], dtype=np.float32)
+        assert np.all(index.query(positions) == 0.0)
+        # distance_transform_edt(~all-True) == distance_transform_edt(all-False) == 0
+        np.testing.assert_allclose(_edt_oracle(mask, positions), 0.0, atol=1e-6)
+
+    def test_all_false_mask_is_all_inf(self) -> None:
+        mask = np.zeros((8, 8, 8), dtype=bool)
+        index = BoundaryDistanceIndex.from_mask(mask)
+        assert index.tree is None
+        positions = np.array([[2.0, 3.0, 4.0], [7.0, 7.0, 7.0]], dtype=np.float32)
+        assert np.all(np.isinf(index.query(positions)))
+
+    def test_index_reuse_has_no_hidden_state(self) -> None:
+        mask = _ball((28, 28, 28), (14.0, 13.0, 15.0), 9.0)
+        rng = np.random.default_rng(1)
+        p1 = rng.uniform(0.0, 28.0, size=(40, 3)).astype(np.float32)
+        p2 = rng.uniform(0.0, 28.0, size=(17, 3)).astype(np.float32)
+        index = BoundaryDistanceIndex.from_mask(mask)
+        q1_first = index.query(p1)
+        _ = index.query(p2)
+        q1_again = index.query(p1)
+        np.testing.assert_array_equal(q1_first, q1_again)
+        np.testing.assert_allclose(q1_first, _edt_oracle(mask, p1), atol=1e-4)
+
+    def test_rejects_bad_mask(self) -> None:
+        with pytest.raises(ValueError, match="3D"):
+            BoundaryDistanceIndex.from_mask(np.ones((4, 4), dtype=bool))
+        with pytest.raises(ValueError, match="bool"):
+            BoundaryDistanceIndex.from_mask(np.ones((4, 4, 4), dtype=np.float32))
+
+
+class TestEvaluatePairBoundaryIndex:
+    def _setup(self):
+        # Same construction as TestBoundaryStratification: a centered True
+        # cube, a regular POI lattice, a bias that grows toward the mask.
+        shape = (32, 32, 32)
+        mask = np.zeros(shape, dtype=bool)
+        mask[8:24, 8:24, 8:24] = True
+        idx = np.arange(2, 30, 4)
+        zz, yy, xx = np.meshgrid(idx, idx, idx, indexing="ij")
+        positions = np.stack([zz.ravel(), yy.ravel(), xx.ravel()], axis=1).astype(np.float32)
+        poi_dist = _edt_oracle(mask, positions)
+        displacements = np.zeros((positions.shape[0], 3), dtype=np.float32)
+        displacements[:, 0] = 5.0 / (1.0 + poi_dist)
+        pair = _eval_pair(gt_shape=shape, shift=(0.0, 0.0, 0.0), mask=mask)
+        field = _make_field(positions, displacements)
+        return pair, field
+
+    def test_precomputed_index_matches_on_the_fly(self) -> None:
+        pair, field = self._setup()
+        bins = (0, 2, 5, 10)
+        a = evaluate_pair(pair, field, distance_bins=bins)
+        index = BoundaryDistanceIndex.from_mask(pair.mask)
+        b = evaluate_pair(pair, field, distance_bins=bins, boundary_index=index)
+        assert a.by_distance is not None and b.by_distance is not None
+        assert a.by_distance.edges == b.by_distance.edges
+        np.testing.assert_array_equal(a.by_distance.counts, b.by_distance.counts)
+        np.testing.assert_allclose(a.by_distance.mae, b.by_distance.mae, equal_nan=True)
+        np.testing.assert_allclose(a.by_distance.rmse, b.by_distance.rmse, equal_nan=True)
+
+    def test_shape_mismatch_raises(self) -> None:
+        pair, field = self._setup()
+        wrong = BoundaryDistanceIndex.from_mask(np.ones((4, 4, 4), dtype=bool))
+        with pytest.raises(ValueError, match="does not match"):
+            evaluate_pair(pair, field, distance_bins=(0, 2, 5, 10), boundary_index=wrong)
+
+    def test_index_ignored_when_table_skipped(self) -> None:
+        pair, field = self._setup()
+        wrong = BoundaryDistanceIndex.from_mask(np.ones((4, 4, 4), dtype=bool))
+        # Empty distance_bins -> no table -> the (mismatched) index is never touched.
+        report = evaluate_pair(pair, field, distance_bins=(), boundary_index=wrong)
+        assert report.by_distance is None
+
+
+class TestBoundaryDistanceIndexSpeedup:
+    @pytest.mark.slow
+    def test_kdtree_path_far_outpaces_full_volume_edt(self) -> None:
+        import time
+
+        from scipy.ndimage import distance_transform_edt
+
+        # A solid ball (~16% foreground) in a volume big enough that the
+        # full-volume EDT is the obvious cost; small enough to stay a
+        # "slow" unit test rather than a benchmark.
+        side = 192
+        shape = (side, side, side)
+        mask = _ball(shape, (side / 2.0, side / 2.0, side / 2.0), side * 0.34)
+        rng = np.random.default_rng(0)
+        fg = np.argwhere(mask)
+        bg = np.argwhere(~mask)
+        positions = np.concatenate(
+            [
+                fg[rng.choice(len(fg), size=250, replace=False)],
+                bg[rng.choice(len(bg), size=250, replace=False)],
+            ]
+        ).astype(np.float32)
+
+        t0 = time.perf_counter()
+        dist_vol = np.asarray(distance_transform_edt(~mask))
+        rounded = np.clip(np.round(positions).astype(np.int64), 0, np.asarray(shape) - 1)
+        expected = dist_vol[rounded[:, 0], rounded[:, 1], rounded[:, 2]].astype(np.float32)
+        t_edt = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        index = BoundaryDistanceIndex.from_mask(mask)
+        t_build = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        got = index.query(positions)
+        t_query = time.perf_counter() - t0
+
+        # Numerically identical to the thing it replaces.
+        np.testing.assert_allclose(got, expected, atol=1e-4)
+        # Re-querying the cached index across a parameter sweep is ~free.
+        assert t_query < 0.1, f"per-variant query took {t_query:.3f}s"
+        # Building + querying once is well under the full-volume EDT — a
+        # coarse sanity bound (the real ratio here is ~10-30x), not a
+        # benchmark. Skip the assertion on the odd machine where the EDT
+        # is somehow trivially fast.
+        if t_edt > 0.2:
+            assert t_build + t_query < t_edt / 4, (
+                f"kdtree path {t_build + t_query:.3f}s vs edt {t_edt:.3f}s"
+            )
 
 
 # --------------------------------------------------------------------- driver

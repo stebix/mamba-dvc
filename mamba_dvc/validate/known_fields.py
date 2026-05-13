@@ -16,13 +16,16 @@ from typing import Any
 
 import numpy as np
 from jaxtyping import Bool, Float32
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import binary_dilation
+from scipy.spatial import KDTree
 
 from mamba_dvc.gpu.dispatch import correlate_multi_gpu
+from mamba_dvc.instrument import timed
 from mamba_dvc.io.dataset import DvcDataset, EvaluationPair
 from mamba_dvc.types import DisplacementField
 
 __all__ = [
+    "BoundaryDistanceIndex",
     "BoundaryStratifiedTable",
     "CorrelateFn",
     "ErrorReport",
@@ -72,6 +75,117 @@ class BoundaryStratifiedTable:
 
 
 @dataclass(frozen=True)
+class BoundaryDistanceIndex:
+    """Amortized "distance to the valid-mask region" lookup for POIs.
+
+    Build once per mask (:meth:`from_mask`); :meth:`query` it once per
+    parameter variant evaluated against that mask. Reproduces
+    ``scipy.ndimage.distance_transform_edt(~mask)`` sampled at rounded
+    POI voxels, exactly:
+
+    - a POI whose rounded center voxel is *inside* the mask (``True`` --
+      the common case, windows are admitted on tissue) gets ``0.0``;
+    - a POI whose center is *outside* the mask (``False`` -- possible
+      when ``mask_threshold < 1``, since ``filter_by_mask`` tests the
+      window's mask support, not the center voxel) gets the Euclidean
+      distance from that voxel to the nearest ``True`` voxel.
+
+    The nearest ``True`` voxel to any ``False`` voxel lies on the
+    26-connected *foreground* boundary shell
+    ``S = mask & binary_dilation(~mask, ones((3, 3, 3)))`` -- the
+    discretized segment from a ``False`` voxel to *any* ``True`` voxel
+    enters ``mask`` at a voxel of ``S`` no farther away -- so a KDTree
+    over ``argwhere(S)`` gives the EDT value exactly while touching only
+    the thin shell (order 1e6 to 1e7 voxels at a 0.1 to 0.2 foreground
+    fraction) instead of the whole volume.
+
+    (Note: ``docs/plans/kdtree-impl-plan.md`` §2 describes the EDT
+    running the other way -- distance from a foreground POI to the
+    nearest *background* voxel. That is the transform of ``mask``, not
+    of ``~mask``; the code in ``_stratify_by_distance`` has always used
+    ``~mask``, and this index matches it. See the test suite and
+    perf-doc R5 for the behavior being preserved.)
+
+    Parameters
+    ----------
+    shape
+        ``(z, y, x)`` shape of the mask the index was built from.
+    mask
+        The source mask, kept so :meth:`query` can return ``0.0`` for a
+        POI whose rounded center lands on a ``True`` voxel.
+    tree
+        ``scipy.spatial.KDTree`` over the foreground-shell voxel
+        coordinates, or ``None`` when the shell is empty (mask all
+        ``True`` -- every POI is on tissue, so all distances are ``0.0``
+        -- or all ``False`` -- no tissue, so all distances are ``inf``).
+    """
+
+    shape: tuple[int, int, int]
+    mask: Bool[np.ndarray, "z y x"]
+    tree: Any  # scipy.spatial.KDTree | None (scipy.spatial ships no type stub)
+
+    @classmethod
+    def from_mask(cls, mask: Bool[np.ndarray, "z y x"]) -> BoundaryDistanceIndex:
+        """Build the boundary index for ``mask``.
+
+        Parameters
+        ----------
+        mask
+            3D boolean mask (``True`` = valid tissue).
+
+        Returns
+        -------
+        BoundaryDistanceIndex
+
+        Raises
+        ------
+        ValueError
+            If ``mask`` is not 3D or does not have boolean dtype.
+        """
+        if mask.ndim != 3:
+            raise ValueError(f"mask must be 3D, got {mask.ndim}D")
+        if mask.dtype != np.bool_:
+            raise ValueError(f"mask must have bool dtype, got {mask.dtype}")
+        with timed("evaluate.boundary_index_build", n_voxels=int(mask.size)):
+            shell = mask & binary_dilation(~mask, structure=np.ones((3, 3, 3), dtype=bool))
+            coords = np.argwhere(shell)
+            tree = KDTree(coords) if coords.size else None
+        shape = (int(mask.shape[0]), int(mask.shape[1]), int(mask.shape[2]))
+        return cls(shape=shape, mask=mask, tree=tree)
+
+    def query(
+        self, positions: Float32[np.ndarray, "points 3"]
+    ) -> Float32[np.ndarray, "points"]:
+        """Distance from each POI's rounded center voxel to the mask region.
+
+        Parameters
+        ----------
+        positions
+            ``(points, 3)`` POI centers in voxel coordinates. Rounded
+            and clipped into ``shape`` the same way the EDT path does.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(points,)`` float32 distances: ``0.0`` for a POI whose
+            rounded center voxel is inside the mask; otherwise the
+            distance to the nearest ``True`` voxel (``inf`` when the
+            mask is empty, matching a no-tissue volume).
+        """
+        rounded = np.clip(
+            np.round(positions).astype(np.int64),
+            a_min=0,
+            a_max=np.asarray(self.shape, dtype=np.int64) - 1,
+        )
+        on_tissue = self.mask[rounded[:, 0], rounded[:, 1], rounded[:, 2]]
+        if self.tree is None:
+            dist_to_tissue = np.full(len(rounded), np.inf)
+        else:
+            dist_to_tissue, _ = self.tree.query(rounded, k=1)
+        return np.where(on_tissue, 0.0, dist_to_tissue).astype(np.float32)
+
+
+@dataclass(frozen=True)
 class ErrorReport:
     """Aggregate accuracy of one ``DisplacementField`` vs its GT."""
 
@@ -94,6 +208,7 @@ def evaluate_pair(
     *,
     distance_bins: Sequence[float] = (0.0, 5.0, 10.0, 20.0, 50.0),
     truth: Float32[np.ndarray, "points 3"] | None = None,
+    boundary_index: BoundaryDistanceIndex | None = None,
 ) -> ErrorReport:
     """Score ``field`` against ``pair.gt_field`` at the field's POIs.
 
@@ -120,6 +235,17 @@ def evaluate_pair(
         materialized pair (same POI lattice) evaluate the GT field
         once and reuse it. The caller is responsible for it matching
         ``field.positions``; only the shape is checked here.
+    boundary_index
+        Optional precomputed :class:`BoundaryDistanceIndex` for
+        ``pair.mask``. Mirrors ``truth``: a caller running many
+        variants against one materialized pair builds it once (the
+        mask is identical across, e.g., a ``mask_threshold`` sweep)
+        and passes it here, avoiding the per-variant rebuild. When
+        ``None`` the index is built on the fly — still much faster than
+        the full-volume distance transform it replaces. Ignored when
+        the boundary table is skipped (``pair.mask is None`` or
+        ``distance_bins`` empty). Its ``shape`` must match
+        ``pair.mask.shape``.
 
     Returns
     -------
@@ -131,8 +257,9 @@ def evaluate_pair(
     ------
     ValueError
         If ``pair.gt_field is None`` and ``truth`` is not supplied
-        (real-deformation entry), or if ``truth`` has a shape other
-        than ``field.displacements.shape``.
+        (real-deformation entry), if ``truth`` has a shape other than
+        ``field.displacements.shape``, or if ``boundary_index.shape``
+        does not match ``pair.mask.shape``.
     """
     if truth is None:
         if pair.gt_field is None:
@@ -140,7 +267,8 @@ def evaluate_pair(
                 f"pair {pair.name!r} has no ground truth (kind={pair.kind!r}); "
                 f"evaluate_pair requires a synthetic entry or an explicit truth="
             )
-        truth = pair.gt_field(field.positions)
+        with timed("evaluate.gt_resample", n_poi=int(field.positions.shape[0])):
+            truth = pair.gt_field(field.positions)
     else:
         truth = np.ascontiguousarray(truth, dtype=np.float32)
         if truth.shape != field.displacements.shape:
@@ -180,13 +308,20 @@ def evaluate_pair(
         )
         by_distance = None
     else:
-        by_distance = _stratify_by_distance(
-            mask=pair.mask,
-            positions=field.positions[valid],
-            err_norm=err_norm,
-            err=err_valid,
-            edges=tuple(float(e) for e in distance_bins),
-        )
+        if boundary_index is not None and boundary_index.shape != pair.mask.shape:
+            raise ValueError(
+                f"boundary_index.shape {boundary_index.shape} does not match "
+                f"pair.mask.shape {pair.mask.shape}"
+            )
+        index = boundary_index or BoundaryDistanceIndex.from_mask(pair.mask)
+        with timed("evaluate.stratify", n_poi=int(err_norm.shape[0])):
+            by_distance = _stratify_by_distance(
+                index=index,
+                positions=field.positions[valid],
+                err_norm=err_norm,
+                err=err_valid,
+                edges=tuple(float(e) for e in distance_bins),
+            )
 
     return ErrorReport(
         name=pair.name,
@@ -264,22 +399,13 @@ def _rankdata(a: np.ndarray) -> np.ndarray:
 
 def _stratify_by_distance(
     *,
-    mask: np.ndarray,
+    index: BoundaryDistanceIndex,
     positions: Float32[np.ndarray, "points 3"],
     err_norm: np.ndarray,
     err: Float32[np.ndarray, "points 3"],
     edges: tuple[float, ...],
 ) -> BoundaryStratifiedTable:
-    distances_volume = distance_transform_edt(~mask)
-    if not isinstance(distances_volume, np.ndarray):
-        raise TypeError("distance_transform_edt did not return an ndarray")
-
-    rounded = np.clip(
-        np.round(positions).astype(np.int64),
-        a_min=0,
-        a_max=np.array(mask.shape, dtype=np.int64) - 1,
-    )
-    poi_dist = distances_volume[rounded[:, 0], rounded[:, 1], rounded[:, 2]]
+    poi_dist = index.query(positions)
 
     n_bins = len(edges)  # k edges -> k bins (k-1 right-closed + 1 terminal)
     counts = np.zeros(n_bins, dtype=np.float32)
