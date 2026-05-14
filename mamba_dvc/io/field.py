@@ -33,6 +33,7 @@ import zarr
 from jaxtyping import Float32
 from scipy.ndimage import map_coordinates, spline_filter
 
+from mamba_dvc.instrument import timed
 from mamba_dvc.io.volume import center_slice
 
 __all__ = ["FieldAxisOrder", "FieldConvention", "GroundTruthField"]
@@ -110,18 +111,23 @@ class GroundTruthField:
             np.negative(normalized, out=normalized)
 
         if interpolation >= _PREFILTER_MIN_ORDER:
-            for axis in range(3):
-                # ``output=np.float32`` keeps the prefilter coefficients (and
-                # the transient buffer) in float32, matching what
-                # ``map_coordinates(prefilter=True)`` does internally for a
-                # float32 input. The scipy stub types ``output`` too narrowly
-                # (``type[float64]``); the runtime accepts any dtype.
-                normalized[..., axis] = spline_filter(
-                    normalized[..., axis],
-                    order=interpolation,
-                    output=np.float32,  # pyright: ignore[reportArgumentType]
-                    mode=_BOUNDARY_MODE,
-                )
+            with timed(
+                "io.gt.spline_filter",
+                order=interpolation,
+                shape=tuple(int(s) for s in normalized.shape[:3]),
+            ):
+                for axis in range(3):
+                    # ``output=np.float32`` keeps the prefilter coefficients (and
+                    # the transient buffer) in float32, matching what
+                    # ``map_coordinates(prefilter=True)`` does internally for a
+                    # float32 input. The scipy stub types ``output`` too narrowly
+                    # (``type[float64]``); the runtime accepts any dtype.
+                    normalized[..., axis] = spline_filter(
+                        normalized[..., axis],
+                        order=interpolation,
+                        output=np.float32,  # pyright: ignore[reportArgumentType]
+                        mode=_BOUNDARY_MODE,
+                    )
             self._prefiltered = True
         else:
             self._prefiltered = False
@@ -188,20 +194,26 @@ class GroundTruthField:
         if vector_axis_size != 3:
             raise ValueError(f"flow array vector axis must be size 3, got {vector_axis_size}")
 
-        if dry_shape is not None:
-            spatial_slice = center_slice(spatial_shape, dry_shape)
-            if axis_order == "3_zyx":
-                full_slice: tuple[slice, ...] = (slice(None), *spatial_slice)
+        decoded_shape = dry_shape if dry_shape is not None else spatial_shape
+        with timed(
+            "io.gt.flow_decode",
+            shape=tuple(int(s) for s in decoded_shape),
+            axis_order=axis_order,
+        ):
+            if dry_shape is not None:
+                spatial_slice = center_slice(spatial_shape, dry_shape)
+                if axis_order == "3_zyx":
+                    full_slice: tuple[slice, ...] = (slice(None), *spatial_slice)
+                else:
+                    full_slice = (*spatial_slice, slice(None))
+                data = np.asarray(zarr_array[full_slice])
             else:
-                full_slice = (*spatial_slice, slice(None))
-            data = np.asarray(zarr_array[full_slice])
-        else:
-            data = np.asarray(zarr_array[:])
+                data = np.asarray(zarr_array[:])
 
-        if axis_order == "3_zyx":
-            data = np.moveaxis(data, 0, -1)
+            if axis_order == "3_zyx":
+                data = np.moveaxis(data, 0, -1)
 
-        data = np.ascontiguousarray(data, dtype=np.float32)
+            data = np.ascontiguousarray(data, dtype=np.float32)
         return cls(data, convention=convention, interpolation=interpolation)
 
     def __call__(
