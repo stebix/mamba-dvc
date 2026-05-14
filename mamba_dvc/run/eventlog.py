@@ -45,9 +45,10 @@ Two scope flavours
 :class:`SessionScope` is the campaign-agnostic primitive — open it
 directly with ``SessionScope(out_dir, series=..., strategy=...)`` from
 non-batch callers (the temporal sweep harness is the v2 consumer).
-:class:`EventSink` is the batch-shaped subclass the CLI uses; its
-``__enter__`` returns a pre-built :class:`StructlogObserver` ready to
-hand to :func:`mamba_dvc.run.run_batch`.
+:class:`EventSink` is the batch-shaped wrapper the CLI uses; it
+composes a :class:`SessionScope` internally and its ``__enter__``
+returns a pre-built :class:`StructlogObserver` ready to hand to
+:func:`mamba_dvc.run.run_batch`.
 
 What is *not* unified
 ---------------------
@@ -63,8 +64,8 @@ single process and across **strictly-serial** ``mamba-dvc run``
 re-invocations against the same campaign dir. **Concurrent invocations
 against the same campaign dir are undefined behaviour**: Windows offers
 no ``O_APPEND`` atomicity guarantee, and event lines exceed PIPE_BUF.
-Each ``EventSink`` lifetime gets a fresh ``session_id`` uuid; downstream
-consumers separate resumed sessions with
+Each :class:`SessionScope` lifetime gets a fresh ``session_id`` uuid;
+downstream consumers separate resumed sessions with
 ``df.groupby("session_id")`` (or by ``batch_start`` boundaries).
 
 Threading
@@ -112,9 +113,16 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from mamba_dvc.run.batch import Job, JobResult
+    from mamba_dvc.types import DisplacementField, SeriesPairStatus
 
 
-__all__ = ["EventSink", "SessionScope", "StructlogObserver", "Tee"]
+__all__ = [
+    "EventSink",
+    "SeriesPairLogger",
+    "SessionScope",
+    "StructlogObserver",
+    "Tee",
+]
 
 
 _EVENTLOG_LOGGER_NAME: Final[str] = "mamba_dvc.eventlog"
@@ -123,7 +131,7 @@ _TIMING_LOGGER_NAME: Final[str] = "mamba_dvc.timing"
 # Loggers the file handler attaches to. Adding ``mamba_dvc.memory`` here
 # in Phase 2 routes memory snapshots to the same file with no schema
 # change. Warnings reach the file via the structlog observer's own
-# logger (see :meth:`EventSink._show_warning`), so ``py.warnings`` is
+# logger (see :meth:`SessionScope._show_warning`), so ``py.warnings`` is
 # deliberately *not* on this list.
 _FILE_LOGGERS: Final[tuple[str, ...]] = (
     _EVENTLOG_LOGGER_NAME,
@@ -229,6 +237,76 @@ class StructlogObserver:
         if self._batch_start_perf is not None:
             duration_s = round(time.perf_counter() - self._batch_start_perf, 3)
         self._log.info("batch_end", n_ok=n_ok, n_failed=n_failed, duration_s=duration_s)
+
+
+# ----------------------------------------------------------------- series observer
+
+
+class SeriesPairLogger:
+    """Structlog-backed :class:`mamba_dvc.types.SeriesPairObserver`.
+
+    Binds ``t_ref`` / ``t_def`` contextvars on :meth:`on_pair_start` and
+    unbinds them on :meth:`on_pair_end`, so every phase record emitted
+    inside the pair window (``dispatch.*``, ``ncc.*``, ``evaluate.*``)
+    inherits the temporal coordinates with no per-call boilerplate.
+    Also emits explicit ``kind:"pair_start"`` and ``kind:"pair_end"``
+    boundary lines so an analyst slicing ``events.jsonl`` can join
+    phases to the originating pair without ad-hoc bracketing.
+
+    Hook → event ``kind``:
+
+    ============================  ==================
+    Hook                          Emitted ``kind``
+    ============================  ==================
+    ``on_pair_start``             ``pair_start``
+    ``on_pair_end``               ``pair_end``
+    ============================  ==================
+
+    The ``pair_end`` row carries ``status`` (the
+    :class:`SeriesPairStatus` member name) and ``n_valid`` (the count of
+    OK POIs on the returned field), so the file alone is sufficient to
+    plot the success rate over a series without re-opening the field
+    archives.
+
+    Usage::
+
+        with SessionScope(out_dir, series="rat-103L"):
+            series = correlate_series(
+                frames,
+                dispatcher=disp,
+                pair_observer=SeriesPairLogger(),
+            )
+    """
+
+    def __init__(self) -> None:
+        self._log = structlog.get_logger(_EVENTLOG_LOGGER_NAME)
+
+    def on_pair_start(self, *, t_ref: int, t_def: int) -> None:
+        """Bind ``t_ref`` / ``t_def`` contextvars; emit ``kind:"pair_start"``."""
+        bind_contextvars(t_ref=t_ref, t_def=t_def)
+        self._log.info("pair_start")
+
+    def on_pair_end(
+        self,
+        *,
+        t_ref: int,
+        t_def: int,
+        status: SeriesPairStatus,
+        field: DisplacementField,
+    ) -> None:
+        """Emit ``kind:"pair_end"`` with status + n_valid; unbind pair vars."""
+        # t_ref / t_def reach the emitted row through the bound contextvars
+        # set in on_pair_start. They are kwargs on the Protocol so callers
+        # can drive the logger without relying on bind state, but the
+        # outgoing row inherits them via merge_contextvars rather than an
+        # explicit duplicate field.
+        del t_ref, t_def
+        self._log.info(
+            "pair_end",
+            status=status.name,
+            n_valid=int(field.valid.sum()),
+        )
+        unbind_contextvars("t_ref", "t_def")
 
 
 # ----------------------------------------------------------------- tee

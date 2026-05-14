@@ -11,10 +11,22 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 import structlog
 from mamba_dvc.instrument import accumulating, timed
-from mamba_dvc.run.eventlog import EventSink, SessionScope, StructlogObserver, Tee
+from mamba_dvc.run.eventlog import (
+    EventSink,
+    SeriesPairLogger,
+    SessionScope,
+    StructlogObserver,
+    Tee,
+)
+from mamba_dvc.types import (
+    DisplacementField,
+    POIStatus,
+    SeriesPairStatus,
+)
 
 from tests.run.test_batch import (
     _fake_correlate,
@@ -433,3 +445,111 @@ class TestSessionScope:
         ev = next(e for e in _read_events(sink.events_path) if e["kind"] == "ping")
         assert ev["campaign"] == "cmp-A"
         assert "session_id" in ev
+
+
+# --------------------------------------------------------------- series pair logger
+
+
+def _make_displacement_field(*, n_ok: int, n_total: int) -> DisplacementField:
+    """Build a minimal :class:`DisplacementField` with a known OK count."""
+    status = np.full(n_total, POIStatus.MASKED, dtype=np.uint8)
+    status[:n_ok] = POIStatus.OK
+    return DisplacementField(
+        positions=np.zeros((n_total, 3), dtype=np.float32),
+        displacements=np.zeros((n_total, 3), dtype=np.float32),
+        valid=(status == POIStatus.OK),
+        confidence=np.zeros(n_total, dtype=np.float32),
+        status=status,
+        grid_shape=(n_total, 1, 1),
+        spacing=(1, 1, 1),
+        window=(8, 8, 8),
+    )
+
+
+class TestSeriesPairLogger:
+    """Cover the structlog-backed :class:`SeriesPairObserver`."""
+
+    def test_pair_start_and_pair_end_round_trip(self, tmp_path: Path) -> None:
+        # The canonical observable: one pair_start line, one pair_end
+        # line, both carrying t_ref / t_def via the contextvar binding.
+        log = SeriesPairLogger()
+        field = _make_displacement_field(n_ok=7, n_total=10)
+        with SessionScope(tmp_path, series="rat-103L"):
+            log.on_pair_start(t_ref=0, t_def=1)
+            log.on_pair_end(t_ref=0, t_def=1, status=SeriesPairStatus.OK, field=field)
+        events = _read_events(tmp_path / "events.jsonl")
+        kinds = [e["kind"] for e in events]
+        assert kinds == ["pair_start", "pair_end"]
+        for ev in events:
+            assert ev["t_ref"] == 0
+            assert ev["t_def"] == 1
+            assert ev["series"] == "rat-103L"
+
+    def test_pair_end_carries_status_name_and_n_valid(self, tmp_path: Path) -> None:
+        # pair_end is the row a downstream analyst joins to per-pair
+        # success counts; status is the SeriesPairStatus member name,
+        # n_valid is field.valid.sum().
+        log = SeriesPairLogger()
+        field = _make_displacement_field(n_ok=42, n_total=125)
+        with SessionScope(tmp_path):
+            log.on_pair_start(t_ref=2, t_def=3)
+            log.on_pair_end(t_ref=2, t_def=3, status=SeriesPairStatus.OK, field=field)
+        end = next(
+            e for e in _read_events(tmp_path / "events.jsonl") if e["kind"] == "pair_end"
+        )
+        assert end["status"] == "OK"
+        assert end["n_valid"] == 42
+
+    def test_failed_pair_end_emits_status_failed(self, tmp_path: Path) -> None:
+        # FAILED is the other SeriesPairStatus member; verify the
+        # status string is the enum name, not the int value.
+        log = SeriesPairLogger()
+        field = _make_displacement_field(n_ok=0, n_total=10)
+        with SessionScope(tmp_path):
+            log.on_pair_start(t_ref=5, t_def=6)
+            log.on_pair_end(t_ref=5, t_def=6, status=SeriesPairStatus.FAILED, field=field)
+        end = next(
+            e for e in _read_events(tmp_path / "events.jsonl") if e["kind"] == "pair_end"
+        )
+        assert end["status"] == "FAILED"
+        assert end["n_valid"] == 0
+
+    def test_phase_records_inside_pair_inherit_t_ref_t_def(self, tmp_path: Path) -> None:
+        # The whole point of the contextvar binding: any phase record
+        # fired between on_pair_start and on_pair_end carries t_ref /
+        # t_def, so events.jsonl is sliceable per-pair without ad-hoc
+        # bracket inference. This is the regression test for the L1
+        # contract documented in docs/triage/event-logging-integration.md.
+        log = SeriesPairLogger()
+        field = _make_displacement_field(n_ok=5, n_total=10)
+        with SessionScope(tmp_path):
+            log.on_pair_start(t_ref=4, t_def=5)
+            with timed("dispatch.build_grid"):
+                pass
+            with timed("ncc.fft_ref"):
+                pass
+            log.on_pair_end(t_ref=4, t_def=5, status=SeriesPairStatus.OK, field=field)
+        phases = [e for e in _read_events(tmp_path / "events.jsonl") if e["kind"] == "phase"]
+        assert len(phases) == 2
+        for p in phases:
+            assert p["t_ref"] == 4
+            assert p["t_def"] == 5
+
+    def test_t_ref_t_def_unbound_after_pair_end(self, tmp_path: Path) -> None:
+        # Pair vars must not leak past on_pair_end -- otherwise a phase
+        # record emitted between pairs (e.g. from a teardown step in
+        # the dispatcher) would attribute itself to the previous pair.
+        log = SeriesPairLogger()
+        field = _make_displacement_field(n_ok=1, n_total=2)
+        with SessionScope(tmp_path):
+            log.on_pair_start(t_ref=10, t_def=11)
+            log.on_pair_end(t_ref=10, t_def=11, status=SeriesPairStatus.OK, field=field)
+            with timed("between_pairs"):
+                pass
+        between = next(
+            e
+            for e in _read_events(tmp_path / "events.jsonl")
+            if e["kind"] == "phase" and e["phase"] == "between_pairs"
+        )
+        assert "t_ref" not in between
+        assert "t_def" not in between

@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 import numpy as np
 from jaxtyping import Bool, Float32, Int64, UInt8
@@ -29,6 +29,7 @@ __all__ = [
     "POIStatus",
     "PairingStrategy",
     "PhysicalUnit",
+    "SeriesPairObserver",
     "SeriesPairStatus",
     "VoxelSpacing",
 ]
@@ -343,6 +344,47 @@ class SeriesPairStatus(IntEnum):
 
     OK = 0
     FAILED = 1
+
+
+class SeriesPairObserver(Protocol):
+    """Hook fired around each pair of :func:`mamba_dvc.pipeline.correlate_series`.
+
+    The temporal driver invokes :meth:`on_pair_start` *before* dispatching a
+    pair and :meth:`on_pair_end` *after* the pair completes (success or
+    per-pair-isolated failure). Implementations live in consumer modules
+    so the pipeline package stays free of structlog / logging imports:
+
+    - :class:`mamba_dvc.run.eventlog.SeriesPairLogger` is the structlog-
+      backed implementation that binds ``t_ref`` / ``t_def`` contextvars
+      and emits ``kind:"pair_start"`` / ``kind:"pair_end"`` lines on the
+      ``events.jsonl`` substrate.
+    - Tests use ad-hoc observers (lists, callable recorders) to assert
+      the protocol shape directly.
+
+    Both hooks must not raise; an observer that fails mid-pair would
+    break the driver's per-pair failure-isolation contract.
+
+    The ``t_ref`` / ``t_def`` arguments are the integer frame indices
+    the caller threaded through ``correlate_series(frames=...)`` -- they
+    are *unitless* (not wall-clock timestamps); see
+    :class:`DisplacementSeries.timestamps` for the optional timestamp
+    alignment.
+    """
+
+    def on_pair_start(self, *, t_ref: int, t_def: int) -> None:
+        """Fire before dispatching the ``(t_ref, t_def)`` pair."""
+        ...
+
+    def on_pair_end(
+        self,
+        *,
+        t_ref: int,
+        t_def: int,
+        status: SeriesPairStatus,
+        field: DisplacementField,
+    ) -> None:
+        """Fire after the pair completes (success or :data:`SeriesPairStatus.FAILED`)."""
+        ...
 
 
 @dataclass(frozen=True)

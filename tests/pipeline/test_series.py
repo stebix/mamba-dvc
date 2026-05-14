@@ -120,6 +120,130 @@ class TestOnPairCallback:
         assert seen == [(1, DisplacementField), (2, DisplacementField)]
 
 
+class _RecordingPairObserver:
+    """Ad-hoc :class:`SeriesPairObserver` that records every hook call.
+
+    Test-double for the protocol; no structlog dependency, so the
+    pipeline-side contract can be asserted without pulling in the
+    eventlog substrate.
+    """
+
+    def __init__(self) -> None:
+        self.starts: list[tuple[int, int]] = []
+        self.ends: list[tuple[int, int, SeriesPairStatus, type]] = []
+
+    def on_pair_start(self, *, t_ref: int, t_def: int) -> None:
+        self.starts.append((t_ref, t_def))
+
+    def on_pair_end(
+        self,
+        *,
+        t_ref: int,
+        t_def: int,
+        status: SeriesPairStatus,
+        field: DisplacementField,
+    ) -> None:
+        self.ends.append((t_ref, t_def, status, type(field)))
+
+
+class TestPairObserverHook:
+    """Protocol-level contract for :class:`SeriesPairObserver`."""
+
+    def test_hooks_fire_around_each_pair_in_order_on_success(self):
+        # SEQUENTIAL with 3 frames -> 2 pairs at indices (0,1), (1,2).
+        # Each pair fires on_pair_start before dispatch and on_pair_end
+        # after. Order is the canonical contract.
+        shape = (48, 48, 48)
+        ref, frames = _make_frames(shape, [(0.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        iterator = enumerate([ref, *frames])
+
+        obs = _RecordingPairObserver()
+        correlate_series(
+            iterator,
+            strategy=PairingStrategy.SEQUENTIAL,
+            pair_observer=obs,
+            **_correlator_kwargs(),
+        )
+
+        assert obs.starts == [(0, 1), (1, 2)]
+        assert [(t_ref, t_def) for t_ref, t_def, *_ in obs.ends] == [(0, 1), (1, 2)]
+        assert all(status == SeriesPairStatus.OK for _, _, status, _ in obs.ends)
+        assert all(field_type is DisplacementField for _, _, _, field_type in obs.ends)
+
+    def test_failed_pair_still_fires_on_pair_end_with_failed_status(self, monkeypatch):
+        # Failure isolation must include the observer: an exception in
+        # the dispatch path produces a FAILED pair_end (not a dropped
+        # call). Mirrors TestFailureIsolation's contract.
+        shape = (48, 48, 48)
+        ref, frames = _make_frames(shape, [(0.0, 1.0, 0.0), (0.0, 1.0, 0.0)])
+        iterator = enumerate([ref, *frames])
+
+        import mamba_dvc.pipeline.series as series_module
+
+        original = series_module.correlate
+        call_count = {"n": 0}
+
+        def flaky(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise RuntimeError("synthetic CUDA OOM")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(series_module, "correlate", flaky)
+
+        obs = _RecordingPairObserver()
+        with pytest.warns(RuntimeWarning, match="failed"):
+            correlate_series(
+                iterator,
+                strategy=PairingStrategy.SEQUENTIAL,
+                pair_observer=obs,
+                **_correlator_kwargs(),
+            )
+
+        assert obs.starts == [(0, 1), (1, 2)]
+        statuses = [status for _, _, status, _ in obs.ends]
+        assert statuses == [SeriesPairStatus.OK, SeriesPairStatus.FAILED]
+
+    def test_on_pair_and_pair_observer_compose(self):
+        # Both side-channels may be supplied; both fire. Documents the
+        # interleaving order: pair_observer.on_pair_start ->
+        # dispatch -> pair_observer.on_pair_end -> on_pair.
+        shape = (48, 48, 48)
+        ref, frames = _make_frames(shape, [(0.0, 1.0, 0.0)])
+        iterator = enumerate([ref, *frames])
+
+        timeline: list[str] = []
+        obs = _RecordingPairObserver()
+
+        # Wrap the observer to record the call site relative to on_pair.
+        original_start = obs.on_pair_start
+        original_end = obs.on_pair_end
+
+        def start_hook(**kwargs):
+            timeline.append("pair_start")
+            original_start(**kwargs)
+
+        def end_hook(**kwargs):
+            timeline.append("pair_end")
+            original_end(**kwargs)
+
+        obs.on_pair_start = start_hook  # type: ignore[method-assign]
+        obs.on_pair_end = end_hook  # type: ignore[method-assign]
+
+        def on_pair(t, _field):
+            timeline.append(f"on_pair({t})")
+
+        correlate_series(
+            iterator,
+            strategy=PairingStrategy.SEQUENTIAL,
+            pair_observer=obs,
+            on_pair=on_pair,
+            **_correlator_kwargs(),
+        )
+
+        assert timeline == ["pair_start", "pair_end", "on_pair(1)"]
+
+
 class TestFailureIsolation:
     def test_per_pair_failure_marks_status_and_keeps_going(self, monkeypatch):
         shape = (48, 48, 48)

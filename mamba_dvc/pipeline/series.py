@@ -46,6 +46,7 @@ from mamba_dvc.types import (
     DisplacementSeries,
     PairingStrategy,
     POIStatus,
+    SeriesPairObserver,
     SeriesPairStatus,
 )
 
@@ -59,6 +60,7 @@ def correlate_series(
     strategy: PairingStrategy = PairingStrategy.SEQUENTIAL,
     dispatcher: MultiGPUDispatcher | None = None,
     on_pair: Callable[[int, DisplacementField], None] | None = None,
+    pair_observer: SeriesPairObserver | None = None,
     window: int | tuple[int, int, int] = 96,
     overlap: float = 0.5,
     mask_threshold: float = 0.9,
@@ -109,6 +111,20 @@ def correlate_series(
         the driver — used for streaming writes, progress bars, or
         per-frame error capture. Receives the deformed-frame ``t``,
         not the ``(t_ref, t_def)`` pair index.
+    pair_observer
+        Optional :class:`SeriesPairObserver` fired with
+        ``on_pair_start`` *before* dispatch and ``on_pair_end`` *after*
+        the pair completes. Carries the full ``(t_ref, t_def)`` pair
+        index plus the resulting :class:`SeriesPairStatus` and
+        :class:`DisplacementField`. Used by
+        :class:`mamba_dvc.run.eventlog.SeriesPairLogger` to bind
+        ``t_ref`` / ``t_def`` contextvars so every phase record fired
+        inside a pair (``dispatch.*``, ``ncc.*``) inherits them, plus
+        emit explicit ``kind:"pair_start"`` / ``kind:"pair_end"`` rows
+        in ``events.jsonl``. The protocol is the structured analogue
+        to ``on_pair``; both may be supplied -- they fire independently
+        in a well-defined order (``pair_observer.on_pair_start`` →
+        dispatch → ``pair_observer.on_pair_end`` → ``on_pair``).
     window, overlap, mask_threshold, tukey_alpha, search_radius
         Forwarded unchanged to :func:`correlate`. The driver introduces
         no new tuning knobs in v1.
@@ -203,6 +219,10 @@ def correlate_series(
         # Broad ``except Exception`` is intentional: per-pair failure
         # isolation is the buildout-doc contract. KeyboardInterrupt /
         # SystemExit derive from BaseException and bypass this branch.
+        if pair_observer is not None:
+            pair_observer.on_pair_start(t_ref=t_ref, t_def=t_def)
+        field: DisplacementField
+        status: SeriesPairStatus
         try:
             if dispatcher is not None:
                 ref_arg = None if anchored_via_dispatcher else reference
@@ -222,7 +242,7 @@ def correlate_series(
                     ncc_mode=ncc_mode,
                     ncc_normalization=ncc_normalization,
                 )
-            return field, SeriesPairStatus.OK
+            status = SeriesPairStatus.OK
         except Exception as exc:
             warnings.warn(
                 f"correlate_series: pair ({t_ref}, {t_def}) failed with"
@@ -230,7 +250,11 @@ def correlate_series(
                 RuntimeWarning,
                 stacklevel=3,
             )
-            return _failed_field(), SeriesPairStatus.FAILED
+            field = _failed_field()
+            status = SeriesPairStatus.FAILED
+        if pair_observer is not None:
+            pair_observer.on_pair_end(t_ref=t_ref, t_def=t_def, status=status, field=field)
+        return field, status
 
     fields: list[DisplacementField] = []
     pair_index_rows: list[tuple[int, int]] = []
