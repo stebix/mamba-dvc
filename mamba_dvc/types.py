@@ -23,6 +23,7 @@ import numpy as np
 from jaxtyping import Bool, Float32, Int64, UInt8
 
 __all__ = [
+    "DispatchObserver",
     "DisplacementField",
     "DisplacementSeries",
     "GridSpec",
@@ -384,6 +385,88 @@ class SeriesPairObserver(Protocol):
         field: DisplacementField,
     ) -> None:
         """Fire after the pair completes (success or :data:`SeriesPairStatus.FAILED`)."""
+        ...
+
+
+class DispatchObserver(Protocol):
+    """Hook fired around each pair dispatched by ``MultiGPUDispatcher``.
+
+    The dispatcher invokes :meth:`on_pair_start` at the top of
+    :meth:`MultiGPUDispatcher.correlate` (after host-side input
+    validation, before the per-pair shared-memory publish) and
+    :meth:`on_pair_end` after the outlier test runs and the merged
+    status array is final, just before the :class:`DisplacementField`
+    return. The hooks fire on every pair that reaches the dispatcher,
+    including pairs the dispatcher itself eventually raises on (a
+    failed pair raises out of the ``with`` block before
+    :meth:`on_pair_end` runs; this is intentional — the
+    :class:`SeriesPairObserver` pair_end above is the one that fires
+    on the failure path because :func:`correlate_series` catches the
+    dispatcher's exception).
+
+    The Protocol is the structured analogue of the parent-process
+    ``dispatch.*`` phase records. Where phase records cover *what
+    happened inside* the dispatch, the dispatch observer brackets
+    *the dispatch itself* — useful for an analyst slicing
+    ``events.jsonl`` who wants the boundary even when no phase
+    records are enabled.
+
+    Implementations live in consumer modules so the dispatcher stays
+    free of structlog / logging imports:
+
+    - :class:`mamba_dvc.run.eventlog.DispatchLogger` is the
+      structlog-backed implementation that emits
+      ``kind:"dispatch_pair_start"`` /
+      ``kind:"dispatch_pair_end"`` lines.
+    - Tests use ad-hoc observers (lists, callable recorders) to
+      assert the protocol shape directly.
+
+    Both hooks must not raise; an observer that fails mid-pair would
+    leave the dispatcher's outer ``with`` block in an unclear state.
+
+    Composition with :class:`SeriesPairObserver`
+    --------------------------------------------
+    When the dispatcher is invoked from inside
+    :func:`mamba_dvc.pipeline.correlate_series` with both observers
+    active, the order per pair is::
+
+        SeriesPairObserver.on_pair_start  (binds t_ref / t_def)
+            DispatchObserver.on_pair_start
+                (...dispatch.* phase records, worker compute...)
+            DispatchObserver.on_pair_end
+        SeriesPairObserver.on_pair_end    (unbinds t_ref / t_def)
+
+    Both dispatch hooks therefore inherit the L1-bound ``t_ref`` /
+    ``t_def`` contextvars automatically — a downstream JSONL reader
+    can join dispatch boundaries to their owning pair without ad-hoc
+    bracketing.
+    """
+
+    def on_pair_start(self, *, volume_shape: tuple[int, int, int]) -> None:
+        """Fire at the top of :meth:`MultiGPUDispatcher.correlate`."""
+        ...
+
+    def on_pair_end(
+        self,
+        *,
+        status_counts: dict[POIStatus, int],
+        n_valid: int,
+    ) -> None:
+        """Fire after the outlier test, before :class:`DisplacementField` return.
+
+        Parameters
+        ----------
+        status_counts
+            Histogram of :class:`POIStatus` values across the merged
+            per-POI status array, after the outlier test has marked
+            its entries. Keys present in the dict are exactly the
+            statuses observed on this pair; entries with zero count
+            are omitted.
+        n_valid
+            Convenience: ``status_counts.get(POIStatus.OK, 0)``. The
+            count of POIs the pair produced a usable displacement
+            for.
+        """
         ...
 
 

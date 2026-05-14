@@ -70,7 +70,7 @@ from mamba_dvc.pipeline._internal import (
     normalize_window,
     resolve_masks,
 )
-from mamba_dvc.types import DisplacementField, GridSpec, POIStatus
+from mamba_dvc.types import DispatchObserver, DisplacementField, GridSpec, POIStatus
 
 try:
     import cupy as _cp  # pyright: ignore[reportMissingImports]
@@ -308,6 +308,23 @@ def _apply_outlier_rejection(
     displacements[outlier_flag] = 0.0
     confidence[outlier_flag] = 0.0
     return status == POIStatus.OK
+
+
+def _status_histogram(status: np.ndarray) -> dict[POIStatus, int]:
+    """Compress a per-POI status array into a ``{POIStatus: count}`` dict.
+
+    Iterates over the :class:`POIStatus` members rather than the unique
+    values in ``status`` so the result is determinate even when a
+    status never occurs (the absent key is omitted, matching the
+    Protocol contract on
+    :meth:`mamba_dvc.types.DispatchObserver.on_pair_end`).
+    """
+    counts: dict[POIStatus, int] = {}
+    for member in POIStatus:
+        n = int(np.count_nonzero(status == member))
+        if n > 0:
+            counts[member] = n
+    return counts
 
 
 def _run_helper_on_device(
@@ -1011,6 +1028,18 @@ class MultiGPUDispatcher:
         an int bypasses the recommender.
     eps, ncc_mode, ncc_normalization
         Forwarded to the helper unchanged.
+    dispatch_observer
+        Optional :class:`mamba_dvc.types.DispatchObserver` fired with
+        ``on_pair_start`` at the top of :meth:`correlate` and
+        ``on_pair_end`` after the outlier test. Lets a consumer
+        bracket every pair the dispatcher actually runs without
+        depending on the temporal driver above. Compose with
+        :class:`mamba_dvc.types.SeriesPairObserver` (driven from
+        :func:`mamba_dvc.pipeline.correlate_series`) to attribute
+        dispatch boundaries to their owning pair via the L1-bound
+        ``t_ref`` / ``t_def`` contextvars; see the Protocol docstring
+        for the full ordering. Default ``None`` keeps the dispatcher
+        side-effect free.
 
     Raises
     ------
@@ -1039,6 +1068,7 @@ class MultiGPUDispatcher:
         eps: float = 1e-12,
         ncc_mode: NCCMode = NCCMode.LINEAR,
         ncc_normalization: NCCNormalization = NCCNormalization.OVERLAP,
+        dispatch_observer: DispatchObserver | None = None,
     ) -> None:
         # Resolve volume shape: explicit > mask > anchored_reference.
         inferred_shape: tuple[int, int, int] | None = None
@@ -1109,6 +1139,7 @@ class MultiGPUDispatcher:
         self._eps = float(eps)
         self._ncc_mode = ncc_mode
         self._ncc_normalization = ncc_normalization
+        self._dispatch_observer = dispatch_observer
 
         # Lifecycle flag.
         self._opened = False
@@ -1439,6 +1470,9 @@ class MultiGPUDispatcher:
             if reference.dtype != np.float32:
                 raise ValueError(f"reference must be float32, got {reference.dtype}")
 
+        if self._dispatch_observer is not None:
+            self._dispatch_observer.on_pair_start(volume_shape=self._volume_shape)
+
         deformed_c = np.ascontiguousarray(deformed)
         reference_c = None if reference is None else np.ascontiguousarray(reference)
 
@@ -1449,6 +1483,12 @@ class MultiGPUDispatcher:
 
         assert self._grid is not None
         valid = _apply_outlier_rejection(self._grid, disp, conf, stat)
+
+        if self._dispatch_observer is not None:
+            self._dispatch_observer.on_pair_end(
+                status_counts=_status_histogram(stat),
+                n_valid=int(valid.sum()),
+            )
 
         return DisplacementField(
             positions=self._grid.positions,

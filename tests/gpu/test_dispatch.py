@@ -20,11 +20,31 @@ from mamba_dvc.core.grid import build_grid
 from mamba_dvc.gpu.dispatch import (
     MultiGPUDispatcher,
     _shard_admitted_indices,
+    _status_histogram,
     correlate_multi_gpu,
 )
 from mamba_dvc.pipeline.correlate import correlate
 from mamba_dvc.types import POIStatus
 from mamba_dvc.validate.synthetic import make_pair, rigid_shift
+
+
+class _RecordingDispatchObserver:
+    """Observer that records every hook call for assertion in tests.
+
+    No structlog import — exercises the
+    :class:`mamba_dvc.types.DispatchObserver` protocol shape directly,
+    so CPU-only and GPU tests can both reach for the same recorder.
+    """
+
+    def __init__(self) -> None:
+        self.starts: list[tuple[int, int, int]] = []
+        self.ends: list[tuple[dict[POIStatus, int], int]] = []
+
+    def on_pair_start(self, *, volume_shape: tuple[int, int, int]) -> None:
+        self.starts.append(volume_shape)
+
+    def on_pair_end(self, *, status_counts: dict[POIStatus, int], n_valid: int) -> None:
+        self.ends.append((dict(status_counts), n_valid))
 
 
 class TestShardAdmittedIndices:
@@ -95,6 +115,50 @@ class TestShardAdmittedIndices:
         assert len(shards) == 3
         for shard in shards:
             assert shard.size == 0
+
+
+class TestStatusHistogram:
+    """Pure-helper coverage for :func:`_status_histogram`. No GPU needed."""
+
+    def test_only_observed_statuses_appear(self):
+        # Mixed status array. Absent statuses (LOW_CONF, OUT_OF_RANGE)
+        # must not appear as zero entries — the Protocol contract says
+        # zero-count members are omitted.
+        status = np.array(
+            [
+                POIStatus.OK,
+                POIStatus.OK,
+                POIStatus.OK,
+                POIStatus.MASKED,
+                POIStatus.OUTLIER,
+            ],
+            dtype=np.uint8,
+        )
+        counts = _status_histogram(status)
+        assert counts == {
+            POIStatus.OK: 3,
+            POIStatus.MASKED: 1,
+            POIStatus.OUTLIER: 1,
+        }
+
+    def test_empty_status_array_returns_empty_dict(self):
+        # Empty (zero-POI) input returns an empty dict, not a dict of
+        # zero-valued entries.
+        status = np.empty(0, dtype=np.uint8)
+        assert _status_histogram(status) == {}
+
+    def test_all_ok_only_returns_ok_entry(self):
+        status = np.full(10, POIStatus.OK, dtype=np.uint8)
+        assert _status_histogram(status) == {POIStatus.OK: 10}
+
+    def test_keys_are_poistatus_members(self):
+        # Keys must be ``POIStatus`` members so consumers can call
+        # ``.name`` for human-readable labels — DispatchLogger relies on
+        # this in the structlog-rendered ``status_counts`` field.
+        status = np.array([POIStatus.OK, POIStatus.MASKED], dtype=np.uint8)
+        counts = _status_histogram(status)
+        for k in counts:
+            assert isinstance(k, POIStatus)
 
 
 def _assert_fields_match(a, b, *, atol_disp: float = 1e-5, atol_conf: float = 1e-5) -> None:
@@ -494,6 +558,27 @@ class TestMultiGPUDispatcherValidation:
         with pytest.raises(RuntimeError, match="with block"):
             _ = d.device_ids
 
+    def test_constructor_accepts_dispatch_observer(self):
+        # CPU-only contract pin: the dispatch_observer kwarg is
+        # optional and storing it does not require CuPy (no
+        # __enter__). The observer is stored verbatim — consumers can
+        # keep their reference and read from it after the with block.
+        observer = _RecordingDispatchObserver()
+        d = MultiGPUDispatcher(
+            device_ids=[0],
+            volume_shape=(16, 16, 16),
+            window=8,
+            dispatch_observer=observer,
+        )
+        assert d._dispatch_observer is observer
+
+    def test_dispatch_observer_defaults_to_none(self):
+        # Backward compatibility pin: omitting dispatch_observer must
+        # leave the dispatcher side-effect free, matching pre-L2
+        # behavior bit-for-bit.
+        d = MultiGPUDispatcher(device_ids=[0], volume_shape=(16, 16, 16), window=8)
+        assert d._dispatch_observer is None
+
 
 @pytest.mark.gpu
 class TestMultiGPUDispatcherInProcess:
@@ -599,6 +684,64 @@ class TestMultiGPUDispatcherInProcess:
                 field = d.correlate(None, deformed)
                 assert field.displacements.shape[1] == 3
             assert d.device_ids == ids_before
+
+    @pytest.mark.slow
+    def test_dispatch_observer_fires_around_each_pair(self):
+        # End-to-end: with a DispatchObserver supplied at construction
+        # the dispatcher must fire on_pair_start before the dispatch
+        # work and on_pair_end after the outlier test, once per
+        # ``.correlate()`` call. Three pairs → three start/end pairs.
+        ref, _ = self._smooth_pair(shift=(0.0, 0.0, 0.0))
+        observer = _RecordingDispatchObserver()
+        kwargs = dict(window=24, overlap=0.5, search_radius=8, batch_size=64)
+
+        with MultiGPUDispatcher(
+            device_ids=[0],
+            anchored_reference=ref,
+            dispatch_observer=observer,
+            **kwargs,
+        ) as d:
+            for shift in ((0.3, 0.0, 0.0), (-0.4, 0.5, 0.0), (0.0, -0.6, 0.7)):
+                _, deformed = self._smooth_pair(shift=shift)
+                d.correlate(None, deformed)
+            assert d.volume_shape == ref.shape
+
+        assert len(observer.starts) == 3
+        assert len(observer.ends) == 3
+        for vshape in observer.starts:
+            assert vshape == ref.shape
+
+    @pytest.mark.slow
+    def test_dispatch_observer_status_counts_match_returned_field(self):
+        # n_valid handed to the observer and the per-status histogram
+        # must agree with the returned DisplacementField — they are
+        # views of the same merged status array post-outlier-rejection.
+        ref, deformed = self._smooth_pair()
+        observer = _RecordingDispatchObserver()
+        kwargs = dict(window=24, overlap=0.5, search_radius=8, batch_size=64)
+
+        with MultiGPUDispatcher(
+            device_ids=[0],
+            volume_shape=ref.shape,
+            dispatch_observer=observer,
+            **kwargs,
+        ) as d:
+            field = d.correlate(ref, deformed)
+
+        assert len(observer.ends) == 1
+        status_counts, n_valid = observer.ends[0]
+        assert n_valid == int(field.valid.sum())
+        # Every reported count must agree with a recount on field.status.
+        for member, count in status_counts.items():
+            assert count == int(np.count_nonzero(field.status == member))
+        # And every status that occurred on the field must show up in
+        # the histogram (the omit-zero-counts contract).
+        for member in POIStatus:
+            occurred = int(np.count_nonzero(field.status == member))
+            if occurred > 0:
+                assert status_counts.get(member) == occurred
+            else:
+                assert member not in status_counts
 
 
 @pytest.mark.gpu
