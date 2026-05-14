@@ -18,7 +18,7 @@ current call-site shapes because each is correct for its concern.
 
 What is unified
 ---------------
-- :class:`EventSink` configures the structlog processor chain and
+- :class:`SessionScope` configures the structlog processor chain and
   attaches a stdlib :class:`logging.FileHandler` to
   ``mamba_dvc.eventlog`` (where :class:`StructlogObserver` writes) and
   ``mamba_dvc.timing`` (the phase records). Warnings reach the same
@@ -27,17 +27,27 @@ What is unified
   fields -- no :func:`logging.captureWarnings` bridge, no
   :func:`warnings.formatwarning` parsing. All three paths render
   identical JSON lines on the same file handle.
-- :class:`EventSink` raises the ``mamba_dvc.timing`` logger to
+- :class:`SessionScope` raises the ``mamba_dvc.timing`` logger to
   ``DEBUG`` for its lifetime (and restores the prior level on
   ``__exit__``) so phase records always reach ``events.jsonl`` while
   events are on. The ``--timing`` CLI flag remains the gate for the
   end-of-run :func:`~mamba_dvc.instrument.accumulating` breakdown panel
   only.
-- :class:`EventSink` binds ``campaign`` and a fresh ``session_id``
-  (uuid4) as contextvars for its lifetime; :class:`StructlogObserver`
+- :class:`SessionScope` binds a fresh ``session_id`` (uuid4) plus any
+  caller-supplied ``**fields`` as contextvars for its lifetime;
+  :class:`EventSink` extends it with ``campaign``; :class:`StructlogObserver`
   binds ``store`` / ``deformation`` per load group and ``variant_id`` /
   ``kind_of_job`` per job. Every event in scope inherits them with no
   per-call boilerplate.
+
+Two scope flavours
+------------------
+:class:`SessionScope` is the campaign-agnostic primitive — open it
+directly with ``SessionScope(out_dir, series=..., strategy=...)`` from
+non-batch callers (the temporal sweep harness is the v2 consumer).
+:class:`EventSink` is the batch-shaped subclass the CLI uses; its
+``__enter__`` returns a pre-built :class:`StructlogObserver` ready to
+hand to :func:`mamba_dvc.run.run_batch`.
 
 What is *not* unified
 ---------------------
@@ -104,7 +114,7 @@ if TYPE_CHECKING:
     from mamba_dvc.run.batch import Job, JobResult
 
 
-__all__ = ["EventSink", "StructlogObserver", "Tee"]
+__all__ = ["EventSink", "SessionScope", "StructlogObserver", "Tee"]
 
 
 _EVENTLOG_LOGGER_NAME: Final[str] = "mamba_dvc.eventlog"
@@ -328,7 +338,7 @@ def _configure_structlog() -> None:
     then applies :func:`_build_formatter`, so native and foreign records
     converge on the same JSON shape.
 
-    Called from :meth:`EventSink.__enter__`. Idempotent: structlog's
+    Called from :meth:`SessionScope.__enter__`. Idempotent: structlog's
     config is process-global and re-configuring it with the same
     processors is harmless.
     """
@@ -344,38 +354,50 @@ def _configure_structlog() -> None:
     )
 
 
-class EventSink:
+class SessionScope:
     """Context manager owning the file handle, structlog config, and stdlib bridge.
+
+    The campaign-agnostic substrate underneath :class:`EventSink`. Use
+    directly when a caller wants ``events.jsonl`` semantics but does not
+    fit the batch-campaign shape (e.g. the temporal sweep harness, which
+    binds ``series`` / ``strategy`` rather than ``campaign``).
 
     Parameters
     ----------
-    campaign_dir
+    out_dir
         Directory under which ``events.jsonl`` is opened (append mode).
-    campaign
-        Campaign name; bound as the ``campaign`` contextvar for the
-        sink's lifetime.
-
-    Yields
-    ------
-    StructlogObserver
-        Pre-built observer the CLI tees with its chosen renderer.
+        Created on ``__enter__`` if it does not exist.
+    **fields
+        Arbitrary contextvar bindings applied for the scope's lifetime
+        on top of a fresh ``session_id`` (uuid4). Every event emitted
+        while the scope is open inherits them via
+        :func:`structlog.contextvars.merge_contextvars`. Keys that
+        collide with ``session_id`` raise ``TypeError`` at construction
+        time -- ``session_id`` is reserved.
 
     Notes
     -----
     See module docstring for the unification stance, resume semantics,
     and threading caveats. Warnings are captured by replacing
-    :func:`warnings.showwarning` for the sink's lifetime -- structured
+    :func:`warnings.showwarning` for the scope's lifetime -- structured
     fields go in, structured fields come out, no
     :func:`warnings.formatwarning` parsing.
+
+    Re-entry within the same process is supported (each
+    ``with SessionScope(...) as s:`` block is self-contained); nested
+    scopes are not -- nesting would double-bind ``session_id`` and break
+    the resume-semantics contract documented at module level.
     """
 
-    def __init__(self, campaign_dir: Path, *, campaign: str) -> None:
-        self._campaign_dir = campaign_dir
-        self._campaign = campaign
+    def __init__(self, out_dir: Path, **fields: Any) -> None:
+        if "session_id" in fields:
+            raise TypeError("'session_id' is reserved and bound automatically")
+        self._out_dir = out_dir
+        self._fields = fields
         self._handler: logging.FileHandler | None = None
         # Stash prior logger levels so __exit__ can put them back rather
         # than wiping them. Loggers under root inherit WARNING by default;
-        # we raise them to allow the records EventSink wants to capture
+        # we raise them to allow the records SessionScope wants to capture
         # (INFO for the observer, DEBUG for phase timing).
         self._prior_levels: dict[str, int] = {}
         self._prior_showwarning: Any = None
@@ -383,13 +405,13 @@ class EventSink:
 
     @property
     def events_path(self) -> Path:
-        """The ``events.jsonl`` path the sink writes to."""
-        return self._campaign_dir / "events.jsonl"
+        """The ``events.jsonl`` path the scope writes to."""
+        return self._out_dir / "events.jsonl"
 
-    def __enter__(self) -> StructlogObserver:
-        """Open the file, attach handlers, bind contextvars; return the observer."""
+    def __enter__(self) -> SessionScope:
+        """Open the file, attach handlers, bind contextvars; return self."""
         _configure_structlog()
-        self._campaign_dir.mkdir(parents=True, exist_ok=True)
+        self._out_dir.mkdir(parents=True, exist_ok=True)
         handler = logging.FileHandler(self.events_path, mode="a", encoding="utf-8")
         handler.setFormatter(_build_formatter())
         handler.setLevel(logging.DEBUG)
@@ -414,9 +436,9 @@ class EventSink:
         self._prior_showwarning = warnings.showwarning
         warnings.showwarning = self._show_warning  # type: ignore[assignment]
 
-        bind_contextvars(campaign=self._campaign, session_id=self._session_id)
+        bind_contextvars(session_id=self._session_id, **self._fields)
         self._handler = handler
-        return StructlogObserver()
+        return self
 
     def __exit__(self, *_exc: object) -> None:
         """Detach handlers, restore prior state, close the file."""
@@ -460,3 +482,46 @@ class EventSink:
             filename=filename,
             lineno=int(lineno),
         )
+
+
+class EventSink:
+    """Batch-shaped wrapper around :class:`SessionScope`.
+
+    The CLI's ``mamba-dvc run`` opens this around :func:`run_batch` so
+    the observer hooks plug into the existing :class:`BatchObserver`
+    consumer chain. Composes a :class:`SessionScope` internally rather
+    than subclassing it: ``__enter__`` returns a :class:`StructlogObserver`
+    where the underlying scope returns ``self``, and that diverging
+    return type is a contract break under LSP. Composition keeps the
+    type relationship honest.
+
+    Parameters
+    ----------
+    campaign_dir
+        Directory under which ``events.jsonl`` is opened (append mode).
+    campaign
+        Campaign name; bound as the ``campaign`` contextvar for the
+        sink's lifetime.
+
+    Yields
+    ------
+    StructlogObserver
+        Pre-built observer the CLI tees with its chosen renderer.
+    """
+
+    def __init__(self, campaign_dir: Path, *, campaign: str) -> None:
+        self._scope = SessionScope(campaign_dir, campaign=campaign)
+
+    @property
+    def events_path(self) -> Path:
+        """The ``events.jsonl`` path the sink writes to."""
+        return self._scope.events_path
+
+    def __enter__(self) -> StructlogObserver:
+        """Open the underlying scope and return a fresh observer."""
+        self._scope.__enter__()
+        return StructlogObserver()
+
+    def __exit__(self, *exc: object) -> None:
+        """Close the underlying scope."""
+        self._scope.__exit__(*exc)

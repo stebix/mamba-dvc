@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 import structlog
 from mamba_dvc.instrument import accumulating, timed
-from mamba_dvc.run.eventlog import EventSink, Tee
+from mamba_dvc.run.eventlog import EventSink, SessionScope, StructlogObserver, Tee
 
 from tests.run.test_batch import (
     _fake_correlate,
@@ -359,3 +359,77 @@ class TestTee:
         assert warnings_emitted, "expected a tee fanout WARNING"
         assert "_Bad" in warnings_emitted[0].getMessage()
         assert "on_batch_end" in warnings_emitted[0].getMessage()
+
+
+# --------------------------------------------------------------- session scope
+
+
+class TestSessionScope:
+    """Cover the campaign-agnostic base scope.
+
+    Most of the file-handle / warning-swap / structlog-config substrate
+    is exercised by every :class:`EventSink` test above (EventSink is a
+    SessionScope). These tests target the surface that's new:
+    arbitrary ``**fields`` binding, the ``session_id`` reservation, and
+    standalone (non-batch) usage.
+    """
+
+    def test_round_trip_with_arbitrary_fields(self, tmp_path: Path) -> None:
+        # SessionScope is the temporal-sweep entry point; pass series /
+        # strategy as bindings and confirm they appear on emitted events
+        # without any 'campaign' binding leaking in.
+        scope = SessionScope(tmp_path, series="rat-103L-fs104", strategy="SEQUENTIAL")
+        with scope, timed("ncc.fft_ref", n_points=64):
+            pass
+        events = _read_events(scope.events_path)
+        phase = next(e for e in events if e["kind"] == "phase")
+        assert phase["phase"] == "ncc.fft_ref"
+        assert phase["series"] == "rat-103L-fs104"
+        assert phase["strategy"] == "SEQUENTIAL"
+        assert "campaign" not in phase
+        assert "session_id" in phase
+
+    def test_session_id_is_reserved(self, tmp_path: Path) -> None:
+        # session_id is bound automatically; collisions are user error,
+        # not silent overwrites.
+        with pytest.raises(TypeError, match="reserved"):
+            SessionScope(tmp_path, session_id="manual")
+
+    def test_session_id_is_fresh_per_scope(self, tmp_path: Path) -> None:
+        # Two scopes open serially against different dirs get distinct
+        # session_ids — the contract resume consumers rely on for the
+        # df.groupby("session_id") workflow.
+        with SessionScope(tmp_path / "a") as s_a:
+            structlog.get_logger("mamba_dvc.eventlog").info("ping")
+            sid_a = s_a._session_id
+        with SessionScope(tmp_path / "b") as s_b:
+            structlog.get_logger("mamba_dvc.eventlog").info("ping")
+            sid_b = s_b._session_id
+        assert sid_a != sid_b
+        ev_a = _read_events(s_a.events_path)
+        ev_b = _read_events(s_b.events_path)
+        assert all(e["session_id"] == sid_a for e in ev_a)
+        assert all(e["session_id"] == sid_b for e in ev_b)
+
+    def test_warnings_routed_without_campaign(self, tmp_path: Path) -> None:
+        # The warning-swap path must work on a bare SessionScope (no
+        # 'campaign' field) — this is the exact configuration the
+        # temporal sweep will use.
+        scope = SessionScope(tmp_path, series="rat-103L-fs104")
+        with scope:
+            warnings.warn("flow_convention is unset", UserWarning, stacklevel=1)
+        warn = next(e for e in _read_events(scope.events_path) if e["kind"] == "warning")
+        assert warn["category"] == "UserWarning"
+        assert warn["series"] == "rat-103L-fs104"
+        assert "campaign" not in warn
+
+    def test_event_sink_still_binds_campaign(self, tmp_path: Path) -> None:
+        # EventSink is now a SessionScope subclass; confirm the campaign
+        # binding still goes through unchanged after the refactor.
+        sink = EventSink(tmp_path, campaign="cmp-A")
+        with sink as obs:
+            assert isinstance(obs, StructlogObserver)
+            structlog.get_logger("mamba_dvc.eventlog").info("ping")
+        ev = next(e for e in _read_events(sink.events_path) if e["kind"] == "ping")
+        assert ev["campaign"] == "cmp-A"
+        assert "session_id" in ev
