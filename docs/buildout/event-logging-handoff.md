@@ -1,39 +1,35 @@
 # Event-logging buildout — handoff
 
 Snapshot for picking up the eventlog wiring in a fresh conversation. The
-full design plan is `docs/triage/event-logging-integration.md`; this doc
-is the **operational entry point** — where things stand on the branch,
-the public surfaces you can use today, and what's still TODO.
+full design plan is `docs/triage/event-logging-integration.md`; this
+doc is the **operational entry point** — where things stand on the
+branch and the public surfaces you can use today.
 
 - **Branch.** `temporal-buildout` (worktree:
   `C:\Users\jstebani\Desktop\worktrees__mamba-dvc\temporal-buildout`)
-- **Merge base with trunk.** `9d3c560` (post-merge of the events.jsonl
-  substrate from trunk into the temporal/multi-GPU buildout).
-- **Status.** Foundations (L0, L1) shipped. Dispatcher-side wiring
-  (L2) and worker-subprocess bridge (L3) are TODO. Harness wiring (L4)
-  is unblocked but unshipped.
+- **Merge base with trunk.** `9d3c560` (post-merge of the
+  `events.jsonl` substrate from trunk into the temporal/multi-GPU
+  buildout).
+- **Status.** All four phases shipped — L0 (SessionScope extract),
+  L1 (`SeriesPairObserver`), L2 (`DispatchObserver`), L3 (worker
+  phase-record bridge), L4 (harness wiring). The temporal sweep
+  produces a fully sliceable `events.jsonl` covering parent **and**
+  worker phases out of the box.
 
 ---
 
-## What's done — L0 + L1
+## What shipped — L0 through L4
 
 ### L0 — `SessionScope` extracted from `EventSink`
 Commit `846b923 refactor(run): extract SessionScope from EventSink`.
 
-`mamba_dvc.run.eventlog.SessionScope` is the campaign-agnostic substrate
-that owns the `events.jsonl` file handle, the structlog config, the
-`warnings.showwarning` swap, and the level management. Takes an
-`out_dir` plus arbitrary `**fields` as contextvar bindings on top of a
-fresh `session_id` (uuid4). `session_id` is reserved — passing it
-raises `TypeError`.
-
-`EventSink` is now a **composition** wrapper around `SessionScope`, not
-a subclass. The `__enter__` return-type diverges (`StructlogObserver`
-vs `SessionScope`) and inheritance would break Liskov; composition
-keeps the types honest. External API of `EventSink` is unchanged.
-
-**File:** `mamba_dvc/run/eventlog.py`
-**Tests:** `tests/run/test_eventlog.py::TestSessionScope` (5 tests)
+`mamba_dvc.run.eventlog.SessionScope` is the campaign-agnostic
+substrate that owns the `events.jsonl` file handle, the structlog
+config, the `warnings.showwarning` swap, and the level management.
+Takes an `out_dir` plus arbitrary `**fields` as contextvar bindings on
+top of a fresh `session_id` (uuid4). `session_id` is reserved — passing
+it raises `TypeError`. `EventSink` is a composition wrapper around
+`SessionScope`; its external API is unchanged.
 
 ### L1 — `SeriesPairObserver` Protocol + `SeriesPairLogger`
 Commit `63b1094 feat(pipeline,run): SeriesPairObserver hook + SeriesPairLogger`.
@@ -42,63 +38,107 @@ Commit `63b1094 feat(pipeline,run): SeriesPairObserver hook + SeriesPairLogger`.
   `on_pair_start(*, t_ref, t_def)` and
   `on_pair_end(*, t_ref, t_def, status, field)`. Lives in `types.py`
   so consumer modules import only the Protocol, never structlog.
-- `mamba_dvc.pipeline.series.correlate_series` — accepts an optional
-  `pair_observer: SeriesPairObserver | None = None`. Default behavior
-  is unchanged. Observer hooks fire in a documented order with the
-  existing `on_pair` callback:
-
-  ```
-  pair_observer.on_pair_start
-      → dispatch (correlate / dispatcher.correlate)
-  pair_observer.on_pair_end
-      → on_pair
-  ```
-
-  Per-pair failure isolation extends to the observer: a FAILED pair
-  still produces `pair_end` with `status=FAILED` and a zero-filled
-  field. The existing `RuntimeWarning` is still emitted.
-
+- `mamba_dvc.pipeline.series.correlate_series` — opt-in
+  `pair_observer: SeriesPairObserver | None = None`. Default
+  behavior unchanged. FAILED pairs still produce `pair_end` with
+  `status=FAILED` and a zero-filled field; the per-pair
+  `RuntimeWarning` is still emitted.
 - `mamba_dvc.run.eventlog.SeriesPairLogger` — structlog-backed
   implementation. Binds `t_ref` / `t_def` as contextvars on
-  `on_pair_start` and unbinds on `on_pair_end`, so every phase record
-  fired inside the pair window (`dispatch.*`, `ncc.*`, `evaluate.*`)
-  inherits the temporal coordinates. Emits explicit `kind:"pair_start"`
-  / `kind:"pair_end"` lines; `pair_end` carries `status.name` and
-  `n_valid`.
+  `on_pair_start` and unbinds on `on_pair_end` so every phase record
+  fired inside the pair window (parent-side `dispatch.*`,
+  `evaluate.*`, plus L3 worker-side `ncc.*`) inherits the temporal
+  coordinates.
 
-**Files:** `mamba_dvc/types.py`, `mamba_dvc/pipeline/series.py`,
-`mamba_dvc/run/eventlog.py`
-**Tests:**
-- `tests/pipeline/test_series.py::TestPairObserverHook` (3 tests —
-  protocol contract, no structlog).
-- `tests/run/test_eventlog.py::TestSeriesPairLogger` (5 tests — full
-  parse-back against a real `SessionScope`).
+### L2 — `DispatchObserver` Protocol + `DispatchLogger`
+Commits `7c88a17 feat(types,gpu): DispatchObserver hook on MultiGPUDispatcher`
+and `9fa80aa feat(run): DispatchLogger + structured pair events in eventlog`.
 
-### Test summary
-- 728 non-GPU tests pass (~4 min). 13 new tests this session.
-- 4 multi-pair persistence regression tests on the GPU (the bug-fix
-  suite from `87096ce`) pass post-merge.
-- `pytest -m gpu` full suite (30 tests) **not yet re-run** after L1;
-  only the persistence subset has been verified on the workstation.
+- `mamba_dvc.types.DispatchObserver` — Protocol with
+  `on_pair_start(*, volume_shape)` and
+  `on_pair_end(*, status_counts, n_valid)`.
+- `MultiGPUDispatcher.__init__` accepts an optional
+  `dispatch_observer` kwarg. Hooks fire at the top of
+  `correlate()` and after the outlier test, once per `.correlate(...)`
+  call. Composes cleanly with L1 — under both, dispatch rows
+  inherit the L1-bound `t_ref` / `t_def` via `merge_contextvars`.
+- `mamba_dvc.run.eventlog.DispatchLogger` — structlog-backed
+  consumer. Emits `kind:"dispatch_pair_start"` (with `volume_shape`)
+  and `kind:"dispatch_pair_end"` (with `status_counts` keyed by
+  `POIStatus.name`, and `n_valid`).
+
+### L3 — Worker-subprocess phase-record bridge
+Commit `a7e08b0 feat(gpu,run): worker phase-record bridge via QueueListener`.
+
+- New `emit_phase_records: bool = False` kwarg on
+  `MultiGPUDispatcher.__init__`. Default keeps multi-process behavior
+  bit-identical to pre-L3.
+- When `True` and the dispatcher routes to multi-process
+  (`len(device_ids) > 1`):
+  - `__enter__` creates a `mp.Queue(maxsize=1024)` and starts a
+    `logging.handlers.QueueListener` that forwards every dequeued
+    record to the parent's `mamba_dvc.timing` logger (so
+    SessionScope's file handler picks them up alongside parent-side
+    `dispatch.*` rows).
+  - Each worker installs a non-blocking
+    `_NonBlockingQueueHandler` on its `mamba_dvc.timing` logger with
+    a `_WorkerLogFilter` that stamps `mdvc_device_id` plus the
+    per-pair context dict forwarded on each pair request.
+  - Parent reads `structlog.contextvars.get_contextvars()` at
+    pair-dispatch time and ships the snapshot to workers; workers
+    re-stamp every key as `mdvc_<key>` extras. `_promote_mdvc_fields`
+    on the parent strips the prefix uniformly. This is what makes
+    `device_id` / `t_ref` / `t_def` / `session_id` show up inline on
+    every worker-originating `kind:"phase"` row.
+- Queue overflow: non-blocking enqueue, per-worker drop counter,
+  surfaced as one `RuntimeWarning` per worker on `__exit__` (rendered
+  by SessionScope as a `kind:"warning"` line).
+- Worker protocol changed: pair message is now a 4-tuple
+  `("pair", deformed_handle, ref_handle, pair_context | None)`;
+  workers send a final `("dropped", count)` on the result pipe at
+  shutdown when logging is on (the parent's recv on that message is
+  the synchronisation point that orders all worker records ahead of
+  the listener's drain).
+- Single-device in-process path needs no L3 wiring — phase records
+  there already flow through the parent's logging tree natively.
+
+### L4 — `SessionScope` in synthetic sweeps
+Commit `90f4cba feat(validate,scripts): open SessionScope in synthetic sweeps`.
+
+- `mamba_dvc.validate.series_error.evaluate_synthetic` gains opt-in
+  `pair_observer` / `dispatch_observer` kwargs. The harness binds
+  `strategy` / `lag` as contextvars around each iteration when an
+  observer is supplied; `dispatch_observer` is forwarded to the
+  `MultiGPUDispatcher` when `device_ids` is set.
+- `scripts/eval_temporal_strategies.py` opens a `SessionScope`
+  around the whole sweep when not `--ephemeral`, with a `series`
+  binding derived from shape/seed/timesteps. Brackets the sweep
+  with `kind:"sweep_start"` / `kind:"sweep_end"` rows carrying the
+  configuration + duration.
 
 ---
 
 ## How to use what's wired today
 
-The temporal sweep can already produce a sliceable `events.jsonl`
-without any further code changes on the dispatcher side. Minimal
-pattern:
+The temporal sweep produces a sliceable `events.jsonl` end-to-end,
+including worker `ncc.*` rows, with the L3 flag set:
 
 ```python
 from mamba_dvc.gpu.dispatch import MultiGPUDispatcher
 from mamba_dvc.pipeline.series import correlate_series
-from mamba_dvc.run.eventlog import SeriesPairLogger, SessionScope
+from mamba_dvc.run.eventlog import (
+    DispatchLogger, SeriesPairLogger, SessionScope,
+)
 
 with SessionScope(
     out_dir, series="rat-103L-fs104", strategy="SEQUENTIAL"
 ) as scope:
     with MultiGPUDispatcher(
-        volume_shape=ref.shape, mask=mask, device_ids=[0, 1, 2, 3], ...
+        volume_shape=ref.shape,
+        mask=mask,
+        device_ids=[0, 1, 2, 3],
+        dispatch_observer=DispatchLogger(),
+        emit_phase_records=True,  # L3 worker bridge
     ) as disp:
         series = correlate_series(
             frames,
@@ -109,136 +149,41 @@ with SessionScope(
 print("events at:", scope.events_path)
 ```
 
-What you get in `events.jsonl` *today*:
+What lands in `events.jsonl` today (every row carries `session_id` +
+any `**fields` bound on `SessionScope`):
 
-| Row | Source | Coverage |
-|---|---|---|
-| `kind:"pair_start"` / `kind:"pair_end"` | `SeriesPairLogger` | one per pair |
-| `kind:"phase"` with `phase:"dispatch.*"` | `instrument.timed` in dispatcher parent | every pair, with `t_ref` / `t_def` bound |
-| `kind:"phase"` with `phase:"ncc.*"` | dispatcher workers | **missing on multi-GPU runs** (L3 deferral) |
-| `kind:"warning"` | per-pair `RuntimeWarning` from `correlate_series` | only on failures |
+| Row                                        | Source                            | Coverage                                       |
+| ------------------------------------------ | --------------------------------- | ---------------------------------------------- |
+| `kind:"pair_start"` / `kind:"pair_end"`    | `SeriesPairLogger`                | one per pair, with `t_ref` / `t_def`           |
+| `kind:"dispatch_pair_start"` / `..._end`   | `DispatchLogger`                  | one per pair the dispatcher runs               |
+| `kind:"phase"` with `phase:"dispatch.*"`   | parent `instrument.timed` blocks  | every pair                                     |
+| `kind:"phase"` with `phase:"ncc.*"`        | workers (L3 bridge)               | every pair, carries `device_id` + pair context |
+| `kind:"warning"`                           | per-pair `RuntimeWarning`         | failures + L3 queue-overflow drops             |
 
-So per-pair *parent-process* visibility is sliceable now. Worker-side
-`ncc.*` records remain dropped on multi-device runs until L3 lands.
-
----
-
-## TODOs
-
-Ordered by the sequencing in
-`docs/triage/event-logging-integration.md`.
-
-### L2 — Per-pair start/end events on `MultiGPUDispatcher`
-
-Adds explicit pair-boundary events emitted by the dispatcher itself,
-useful for ad-hoc dispatcher use (not just from inside
-`correlate_series`).
-
-- **Files.** `mamba_dvc/types.py` (`DispatchObserver` Protocol),
-  `mamba_dvc/gpu/dispatch.py` (constructor + `correlate` hook),
-  `mamba_dvc/run/eventlog.py` (`DispatchLogger` structlog impl),
-  `tests/gpu/test_dispatch.py`.
-- **Protocol surface (planned).**
-  ```python
-  class DispatchObserver(Protocol):
-      def on_pair_start(self, *, volume_shape: tuple[int, int, int]) -> None: ...
-      def on_pair_end(
-          self, *, status_counts: dict[POIStatus, int], n_valid: int
-      ) -> None: ...
-  ```
-- **Commits (planned, in order).**
-  1. `feat(types,gpu): DispatchObserver hook on MultiGPUDispatcher`
-     (Protocol + dispatcher hook with no consumer — reviewable alone).
-  2. `feat(run): DispatchLogger + structured pair events in eventlog`
-     (structlog consumer; lands after dispatcher contract is reviewed).
-- **Composes with L1.** When both L1 and L2 are active, dispatcher
-  `pair_start` / `pair_end` rows automatically carry the
-  L1-bound `t_ref` / `t_def` contextvars.
-
-### L3 — Worker-subprocess phase-record bridge
-
-The deferral the `eventlog.py` module docstring explicitly calls out.
-Highest-risk piece of the wiring (process-boundary logging).
-
-- **Mechanism.** `multiprocessing.Queue` + `logging.handlers.QueueListener`.
-  Workers install a `QueueHandler` on `mamba_dvc.timing` plus a
-  `_DeviceIdFilter` that injects `mdvc_device_id` on every record.
-  Parent's `QueueListener` thread re-emits records on its own timing
-  logger where `SessionScope`'s file handler picks them up. After
-  `_promote_mdvc_fields`, each JSON line carries top-level `device_id`.
-- **Gating.** New `emit_phase_records: bool = False` on
-  `MultiGPUDispatcher.__init__`. Default keeps current behavior
-  bit-identical.
-- **Pair-context propagation.** *Don't* propagate contextvars across
-  the process boundary. The parent is synchronously blocked on the
-  worker join during a pair; its contextvars at re-emit time are the
-  correct pair's contextvars. Listener thread inherits them.
-- **Backpressure.** Bounded queue (1024), non-blocking enqueue,
-  drop counter surfaced as `kind:"warning"` on `__exit__`.
-- **Tests.** `test_worker_phase_records_propagate` (GPU, skip-if-<2
-  devices); `test_worker_phase_dropped_records_surface_as_warning`
-  (CPU-only, monkeypatch queue maxsize=1).
-- **Risk.** Pickle constraints on `LogRecord` payloads, listener
-  thread crash isolation, queue full handling. The triage doc covers
-  the mitigations.
-
-### L4 — Wire `SessionScope` into the harnesses
-
-Application-layer wiring. Two callers want it:
-
-1. **`mamba_dvc/validate/synthetic.py::evaluate_synthetic`** — open
-   a `SessionScope` around the outer sweep loop with bindings
-   `series=...`, supply a `SeriesPairLogger` to `correlate_series`.
-2. **`scripts/eval_temporal_strategies.py`** — same pattern plus a
-   `kind:"sweep_start"` / `kind:"sweep_end"` bracket around the whole
-   strategy × lag grid.
-
-Unblocked by L0+L1 today — could land before L2/L3 if you want the
-temporal sweep to start producing `events.jsonl` immediately. L2/L3
-add detail to the rows already produced; they don't change the call
-site.
-
----
-
-## Open design decisions to revisit
-
-1. **L1 contract: `pair_observer` / `on_pair` interleaving.** The
-   docstring on `correlate_series.pair_observer` documents the order
-   `on_pair_start → dispatch → on_pair_end → on_pair`. If L2 changes
-   that order (e.g. `pair_observer.on_pair_start` could move *inside*
-   `dispatcher.correlate` rather than around it), it's a contract
-   change worth surfacing then. Today both sit at the same level in
-   `_run_pair`.
-2. **L2 protocol-vs-direct.** Triage doc recommends the Protocol
-   approach (`DispatchObserver` in `types.py`, structlog impl in
-   `run/eventlog.py`) for consistency with L1. The cheaper alternative
-   is a direct structlog call inside `dispatch.py` itself; that
-   couples `gpu/dispatch.py` to `run/eventlog.py`. Recommend keeping
-   the Protocol pattern.
-3. **L3 contextvar strategy.** Two options were sketched: (a) forward
-   `(t_ref, t_def)` into the worker on the per-pair request payload
-   and re-bind worker-side; (b) let the parent listener thread tag
-   records with the parent's *current* contextvars at re-emit time.
-   (b) is cleaner — workers stay context-unaware, exploits the
-   synchronous worker join. Recommendation: (b).
+Single-device runs (`device_ids=[d]` or `device_ids=[0,0]` on a dev
+host) need no `emit_phase_records=True` — phase records flow through
+the parent's logging tree natively, and you still get parent-side
+`dispatch.*` records. The flag is meaningful only when the dispatcher
+actually spawns workers.
 
 ---
 
 ## References
 
 - **Full design plan.** `docs/triage/event-logging-integration.md` —
-  the four-phase plan, including the code sketches and the test
-  matrix for L3.
+  the four-phase plan, code sketches, and test matrix.
 - **Related triage.** `docs/triage/multi-gpu-aliasing-bug.md` — the
   bug whose investigation motivated making the dispatch cycle
   debuggable in the first place.
 - **Trunk-side substrate docs.** `docs/buildout/logging-pipeline.md`
-  (from trunk's merge) — the original design of the `events.jsonl`
-  substrate.
+  — the original design of the `events.jsonl` substrate.
 - **Key commits on this branch.**
   - `9d3c560` — merge: trunk events.jsonl substrate
   - `846b923` — L0 (SessionScope extract)
   - `63b1094` — L1 (SeriesPairObserver + SeriesPairLogger)
+  - `7c88a17` / `9fa80aa` — L2 (DispatchObserver Protocol + Logger)
+  - `90f4cba` — L4 (SessionScope in synthetic sweeps)
+  - `a7e08b0` — L3 (worker phase-record bridge via QueueListener)
 
 ---
 
@@ -251,16 +196,17 @@ uv run pytest -m "not gpu"
 # Multi-pair persistence regression suite (the bug-fix tests)
 uv run pytest tests/gpu/test_dispatch.py::TestMultiGPUDispatcherMultiProcessPersistence
 
-# Full GPU suite (~30 tests, requires CUDA)
-uv run pytest -m gpu
+# L3 end-to-end propagation (multi-process path, uses device_ids=[0,0]
+# so it runs on a single-GPU dev host).
+uv run pytest tests/gpu/test_dispatch.py::TestMultiGPUDispatcherEventLogging
 
 # Format + lint + typecheck gate
 uv run ruff format . ; uv run ruff check . ; uv run pyright
 ```
 
-The pre-commit hooks mirror the lint/typecheck gate. `nbstripout`
-is required in the main repo's venv (not auto-installed by
-`uv sync`); install once with:
+The pre-commit hooks mirror the lint/typecheck gate. `nbstripout` is
+required in the main repo's venv (not auto-installed by `uv sync`);
+install once with:
 
 ```powershell
 uv pip install --python "C:/Users/jstebani/Desktop/mamba-dvc/.venv/Scripts/python.exe" nbstripout
