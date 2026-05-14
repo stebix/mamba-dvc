@@ -600,3 +600,64 @@ class TestPrefetch:
         spec = _spec(tmp_path, stores=["scanA.zarr"], prefetch=prefetch)
         run_batch(spec, correlate_fn=correlate_fn, open_dataset=_opener_for({store: ds}))
         assert overlap_observed[0] is expect_overlap
+
+
+class TestStructlogObserver:
+    """``run_batch`` with the events.jsonl observer (no behavioural change)."""
+
+    def test_run_batch_with_structlog_observer(self, tmp_path: Path) -> None:
+        # Equivalent campaign run twice: once with NullObserver, once
+        # with StructlogObserver inside an EventSink. The job outcomes
+        # must be identical (status, summary keys, npz/sidecar paths),
+        # and the events file must contain a complete lifecycle.
+        from mamba_dvc.run import EventSink, StructlogObserver
+
+        store_a = tmp_path / "a.zarr"
+        store_b = tmp_path / "b.zarr"
+        ds_a = _FakeDataset(real=[], synthetic=["fs1"])
+        ds_b = _FakeDataset(real=[], synthetic=["fs2"])
+
+        # Baseline run (different out_dir so resume cannot interfere).
+        spec_base = _spec(
+            tmp_path, stores=["a.zarr", "b.zarr"], out_dir=str(tmp_path / "out_base")
+        )
+        baseline = run_batch(
+            spec_base,
+            correlate_fn=_fake_correlate,
+            open_dataset=_opener_for({store_a: ds_a, store_b: ds_b}),
+            observer=NullObserver(),
+        )
+
+        # Sink run; fresh datasets so call counts compare cleanly.
+        ds_a2 = _FakeDataset(real=[], synthetic=["fs1"])
+        ds_b2 = _FakeDataset(real=[], synthetic=["fs2"])
+        spec_sink = _spec(
+            tmp_path, stores=["a.zarr", "b.zarr"], out_dir=str(tmp_path / "out_sink")
+        )
+        with EventSink(spec_sink.campaign_dir, campaign=spec_sink.campaign) as obs:
+            assert isinstance(obs, StructlogObserver)
+            sink_results = run_batch(
+                spec_sink,
+                correlate_fn=_fake_correlate,
+                open_dataset=_opener_for({store_a: ds_a2, store_b: ds_b2}),
+                observer=obs,
+            )
+
+        # Outcome parity: same statuses, same number of results, same
+        # load_pair call count.
+        assert [r.status for r in baseline] == [r.status for r in sink_results]
+        assert len(ds_a.load_pair_calls) == len(ds_a2.load_pair_calls)
+        assert len(ds_b.load_pair_calls) == len(ds_b2.load_pair_calls)
+
+        # Events file: at least one batch_start / batch_end and matching
+        # job_start / job_end counts.
+        events_path = spec_sink.campaign_dir / "events.jsonl"
+        assert events_path.exists()
+        kinds = [
+            json.loads(line)["kind"]
+            for line in events_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert kinds.count("batch_start") == 1
+        assert kinds.count("batch_end") == 1
+        assert kinds.count("job_start") == kinds.count("job_end") == len(sink_results)

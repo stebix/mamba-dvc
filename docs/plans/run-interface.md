@@ -349,6 +349,7 @@ Notes:
 results/<campaign>/
   config.snapshot.yaml                 # the exact config used (copied at launch)
   manifest.jsonl                       # one JSON object per (store, deformation, variant) result
+  events.jsonl                         # append-only event stream from `mamba-dvc run` (CLI only)
   variants.json                        # variant_id → { name, params }   (decode hash ids)
   <store_stem>/
     <deformation>/
@@ -386,6 +387,31 @@ df.query("deformation == 'fs104'").groupby("mask_threshold")[["n_ok", "mae", "rm
 
 For `real` entries `mae/rmse/p95/per_axis_mae` and `error_report` are
 absent (no GT); `n_ok`/`n_masked`/… and timings are still there.
+
+**`events.jsonl`** is the CLI-only append-only event stream (see
+`mamba_dvc/run/eventlog.py`). One JSON line per event with a `kind`
+discriminator: `batch_start`, `pair_load_start`, `job_start`, `job_end`,
+`batch_end`, plus `phase` lines for every `mamba_dvc.timing` record
+(`batch.load_pair`, `dispatch.*`, `evaluate.*`, etc.) and `warning`
+lines for every `warnings.warn` raised during the campaign. Every line
+carries `ts` (UTC ISO timestamp), `campaign`, and `session_id` (uuid4
+per `mamba-dvc run` invocation, so resumed files are groupable). Inside
+a load group, `store` / `deformation` are inherited; inside a job,
+`variant_id` / `kind_of_job` are inherited.
+
+```python
+df = pd.read_json("results/results_v1/events.jsonl", lines=True)
+df.groupby("kind").size()                                   # counts
+df.query("kind == 'phase'")["phase"].value_counts()          # phase histogram
+df.query("kind == 'job_end' and status == 'failed'")[["variant_id", "phase"]]
+```
+
+The events stream is the CLI's responsibility — `run_batch` itself
+stays print- and write-free in its lifecycle. `--no-events` opts out;
+`--dry-run` never writes an events file. Concurrent `mamba-dvc run`
+invocations against the same campaign dir are **undefined behaviour**
+(append-mode atomicity is not guaranteed on Windows for lines larger
+than PIPE_BUF).
 
 ## 8. Test surface
 
