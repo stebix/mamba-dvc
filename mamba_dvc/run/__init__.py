@@ -24,6 +24,7 @@ See ``docs/plans/run-interface.md`` for the design contract.
 from __future__ import annotations
 
 from mamba_dvc.run.batch import Job, JobResult, plan_jobs, run_batch
+from mamba_dvc.run.campaign import load_campaign_field
 from mamba_dvc.run.config import BatchSpec, Variant
 from mamba_dvc.run.eventlog import EventSink, StructlogObserver, Tee
 from mamba_dvc.run.progress import BatchObserver, NullObserver
@@ -38,6 +39,7 @@ __all__ = [
     "StructlogObserver",
     "Tee",
     "Variant",
+    "load_campaign_field",
     "plan_jobs",
     "run_batch",
 ]
