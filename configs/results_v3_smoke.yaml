@@ -1,0 +1,57 @@
+# Smoke variant of results_v3 — single cell, cropped subvolume.
+#
+# Purpose. Exercise the full results_v3 code path (store open → manifest
+# discovery → dispatch → multi-GPU correlate → sidecar → manifest.jsonl)
+# end-to-end in a couple of minutes, so the campaign can be smoke-checked
+# before launching the real surface (`configs/results_v3.yaml`).
+#
+# Knob-for-knob identical to v3 *except* for the scope-cutting fields:
+#   * stores: just 5R_Ti_4w_000 (verifies OK, no v2 OOM history,
+#     no upstream corruption — the safest of the three).
+#   * select.synthetic: [fs104] (median deformation; fs004 has the
+#     near-zero-GT pathology, fs204 is the one that OOM'd in v2).
+#   * sweep.mask_threshold: [0.9] (single operating point).
+#   * dry_shape: [256, 256, 256] — centered subblock; with window 96 and
+#     stride 19 (overlap 0.8) this is ~9³ ≈ 729 POIs per variant. The
+#     full pipeline runs, the FFT is just much smaller.
+#
+# Output lands under <out_dir>\results_v3_smoke\ so it cannot collide
+# with the real v3 surface.
+#
+#     uv run mamba-dvc run configs/results_v3_smoke.yaml --dry-run
+#     uv run mamba-dvc run configs/results_v3_smoke.yaml
+
+campaign: results_v3_smoke
+
+stores:
+  - C:\Users\jstebani\Desktop\dvc-data-storage\5R_Ti_4w_000.zarr
+
+manifest: null
+strict: false            # not strictly needed for 5R_Ti; kept aligned with v3
+
+select:
+  real: none
+  synthetic: [fs104]
+
+defaults:
+  window: 96
+  overlap: 0.8
+  mask: mask_fill
+  mask_threshold: 0.9    # overridden by the sweep below
+  flow_convention: push_forward
+  batch_size: auto
+  ncc_mode: linear
+  ncc_normalization: overlap
+  search_radius: null
+  tukey_alpha: null
+  dry_shape: [256, 256, 256]   # centered subblock — the only real runtime knob here
+
+sweep:
+  mask_threshold: [0.9]
+
+variants: []
+
+devices: [0, 1, 2, 3]
+distance_bins: []
+prefetch: 1
+out_dir: C:\Users\jstebani\Desktop\dvc-result-storage   # campaign dir is <out_dir>\results_v3_smoke\
