@@ -113,6 +113,25 @@ class TestFieldToPolyData:
         active = poly.active_vectors_name
         assert active == "displacement"
 
+    def test_stride_decimates_after_valid_filter(self):
+        field = _tiny_field()
+        # Baseline: only valid POIs.
+        baseline = field_to_polydata(field, only_valid=True)
+        strided = field_to_polydata(field, only_valid=True, stride=2)
+        # ``stride=2`` keeps every other POI from the valid subset.
+        assert strided.n_points == (baseline.n_points + 1) // 2
+
+    def test_stride_one_is_passthrough(self):
+        field = _tiny_field()
+        baseline = field_to_polydata(field, only_valid=True)
+        strided = field_to_polydata(field, only_valid=True, stride=1)
+        assert strided.n_points == baseline.n_points
+
+    def test_stride_zero_raises(self):
+        field = _tiny_field()
+        with pytest.raises(ValueError, match="positive integer"):
+            field_to_polydata(field, stride=0)
+
     def test_magnitude_is_l2_of_scaled_displacement(self):
         field = _tiny_field()
         spacing = VoxelSpacing((2.0, 1.0, 0.5), "um")

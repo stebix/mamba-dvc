@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 
 __all__ = [
+    "downsample_for_render",
     "field_to_polydata",
     "grid_to_structured",
     "mask_to_image_data",
@@ -225,6 +226,7 @@ def field_to_polydata(
     *,
     only_valid: bool = True,
     spacing: VoxelSpacing | tuple[float, float, float] | None = None,
+    stride: int | None = None,
 ) -> pv.PolyData:
     """Build a :class:`pyvista.PolyData` carrying POI points + displacements.
 
@@ -245,14 +247,26 @@ def field_to_polydata(
         Voxel spacing; coordinates are scaled by ``spacing.values``.
         ``positions`` are stored ``(z, y, x)`` in voxel units; the
         polydata is written ``(x, y, z)`` in spacing units.
+    stride
+        Optional uniform decimation applied *after* the ``only_valid``
+        filter: keep every ``stride``-th remaining POI. ``None`` or
+        ``1`` keeps every POI. Must be a positive integer.
 
     Returns
     -------
     pyvista.PolyData
         Point cloud with arrays ``"displacement"`` (vectors),
         ``"magnitude"``, ``"valid"``, ``"status"``, ``"confidence"``.
+
+    Raises
+    ------
+    ValueError
+        If ``stride`` is provided and is not a positive integer.
     """
     import pyvista as pv
+
+    if stride is not None and stride < 1:
+        raise ValueError(f"stride must be a positive integer, got {stride}")
 
     sp = normalize_spacing(spacing)
     sx, sy, sz = sp.values[2], sp.values[1], sp.values[0]
@@ -270,6 +284,13 @@ def field_to_polydata(
         status = status[keep]
         confidence = confidence[keep]
         valid = valid[keep]
+
+    if stride is not None and stride > 1:
+        positions = positions[::stride]
+        displacements = displacements[::stride]
+        status = status[::stride]
+        confidence = confidence[::stride]
+        valid = valid[::stride]
 
     # (z, y, x) -> (x, y, z) and scale into spacing units.
     points = np.empty_like(positions)
@@ -348,3 +369,81 @@ def grid_to_structured(
             )
         structured.point_data[scalar_name] = scalars.astype(np.float32, copy=False)
     return structured
+
+
+def downsample_for_render(
+    volume: Float32[np.ndarray, "z y x"],
+    mask: Bool[np.ndarray, "z y x"] | None = None,
+    spacing: VoxelSpacing | None = None,
+    factor: int = 2,
+) -> tuple[
+    Float32[np.ndarray, "z y x"],
+    Bool[np.ndarray, "z y x"] | None,
+    VoxelSpacing,
+]:
+    """Strided downsample of a host volume + mask, with matching scaled spacing.
+
+    Strided slicing only (no resampling): the first voxel center stays
+    at ``(0, 0, 0)`` so a :class:`DisplacementField` whose ``positions``
+    are voxel indices into the *original* volume aligns physically with
+    the returned ``volume_ds`` when both are passed to PyVista with their
+    respective :class:`VoxelSpacing` — the field with the *original*
+    spacing, the volume with the returned ``spacing_ds``.
+
+    Parameters
+    ----------
+    volume
+        ``(z, y, x)`` float32 host volume.
+    mask
+        Optional same-shape boolean mask; downsampled with the same
+        stride so it stays voxel-aligned with ``volume_ds``.
+    spacing
+        Voxel spacing of ``volume``. ``None`` is treated as the
+        unit-voxel spacing (see :func:`normalize_spacing`).
+    factor
+        Strided-downsample factor. Must be a positive integer; ``1``
+        is a no-op pass-through.
+
+    Returns
+    -------
+    tuple
+        ``(volume_ds, mask_ds, spacing_ds)``. ``mask_ds`` is ``None``
+        when ``mask`` was ``None``. ``spacing_ds`` carries values
+        scaled by ``factor`` along every axis and the same ``unit`` as
+        the input spacing.
+
+    Raises
+    ------
+    ValueError
+        If ``factor`` is less than 1, ``volume`` is not 3D, or
+        ``mask.shape`` does not match ``volume.shape``.
+
+    Notes
+    -----
+    Strided slicing is intentional. ``scipy.ndimage.zoom`` and similar
+    resamplers can shift the first voxel center by up to half a voxel,
+    which puts the field glyphs and the bone subtly out of register —
+    exactly the alignment failure mode this primitive is supposed to
+    rule out. The cost is no anti-aliasing: when ``factor`` is large
+    (≥ 4) and the volume carries high-frequency content, the render
+    will alias, but never drift.
+    """
+    if not isinstance(factor, int) or factor < 1:
+        raise ValueError(f"factor must be a positive integer, got {factor!r}")
+    if volume.ndim != 3:
+        raise ValueError(f"volume must be 3D, got ndim={volume.ndim}")
+    if mask is not None and mask.shape != volume.shape:
+        raise ValueError(f"mask shape {mask.shape} does not match volume shape {volume.shape}")
+
+    sp = normalize_spacing(spacing)
+
+    if factor == 1:
+        return volume, mask, sp
+
+    vol_ds = volume[::factor, ::factor, ::factor]
+    mask_ds = mask[::factor, ::factor, ::factor] if mask is not None else None
+    spacing_ds = VoxelSpacing(
+        (sp.values[0] * factor, sp.values[1] * factor, sp.values[2] * factor),
+        sp.unit,
+    )
+    return vol_ds, mask_ds, spacing_ds
