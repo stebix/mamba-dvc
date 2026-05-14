@@ -52,7 +52,10 @@ class _FakeDataset:
     def list_synthetic(self) -> list[str]:
         return list(self._synthetic)
 
-    def load_pair(self, deformation: str, *, mask=None, dry_shape=None) -> _Pair:
+    def load_pair(
+        self, deformation: str, *, mask=None, dry_shape=None, gt_interpolation=3
+    ) -> _Pair:
+        del gt_interpolation  # mock has no real GT field to rebuild
         self.load_pair_calls.append((deformation, mask, dry_shape))
         kind = "synthetic" if deformation in self._synthetic else "real"
         gt = self.gt[deformation] if kind == "synthetic" else None

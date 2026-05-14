@@ -638,11 +638,14 @@ def _load_or_capture(ds: DvcDataset, load_key: Any, *, store_name: str) -> _Load
     flagged for fields that emit before any inner bind
     (``docs/buildout/logging-pipeline.md`` §"Threading & concurrency").
     """
-    deformation, mask_sel, dry_shape = load_key
+    deformation, mask_sel, dry_shape, gt_interpolation = load_key
     try:
         with timed("batch.load_pair", store=store_name, deformation=deformation):
             pair = ds.load_pair(
-                deformation, mask=_mask_selector(mask_sel), dry_shape=dry_shape
+                deformation,
+                mask=_mask_selector(mask_sel),
+                dry_shape=dry_shape,
+                gt_interpolation=gt_interpolation,
             )
     except Exception:
         return None, traceback.format_exc()
@@ -760,11 +763,11 @@ def _group_by(items: Iterable[Job], key: Callable[[Job], Any]) -> list[tuple[Any
     return list(groups.items())
 
 
-def _load_group_key(job: Job) -> tuple[str, Any, tuple[int, int, int] | None]:
+def _load_group_key(job: Job) -> tuple[str, Any, tuple[int, int, int] | None, int]:
     lp = job.variant.load_params
     dry = lp["dry_shape"]
     dry_tuple = (int(dry[0]), int(dry[1]), int(dry[2])) if dry is not None else None
-    return (job.deformation, lp["mask"], dry_tuple)
+    return (job.deformation, lp["mask"], dry_tuple, int(lp["gt_interpolation"]))
 
 
 def _grid_key(variant: Variant) -> tuple[Any, ...]:

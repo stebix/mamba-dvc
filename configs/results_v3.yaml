@@ -60,6 +60,7 @@ defaults:                 # base correlation params; every variant starts here
   search_radius: null     # null → window // 2
   tukey_alpha: null       # null → the per-ncc-mode default
   dry_shape: null         # null → full volume; [z, y, x] → centered subblock for smoke runs
+  gt_interpolation: 1     # linear interp of the flow vector field at POI positon
 
 sweep:                    # cartesian product over named axes (each value → a variant)
   mask_threshold: [0.9, 0.7, 0.5]   # same operating-point sweep as v2 for direct comparison

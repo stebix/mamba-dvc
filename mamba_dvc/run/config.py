@@ -58,9 +58,18 @@ _BUILTIN_DEFAULTS: dict[str, Any] = {
     "mask": None,  # None → profile/manifest default; "none" → no mask
     "dry_shape": None,  # None → full volume; [z, y, x] → centered subblock
     "flow_convention": None,  # None → defer to manifest/profile (warned)
+    # ``gt_interpolation`` is the spline order used to sample the
+    # synthetic ground-truth flow at POI centers (cubic B-spline by
+    # default). ``>= 2`` pays a one-time recursive prefilter at
+    # ``GroundTruthField`` construction; ``<= 1`` skips it entirely and
+    # turns the 90-180 s ``io.gt.spline_filter`` phase into a no-op,
+    # trading sub-percent sampling accuracy on smooth flows for load
+    # wall-time. Lives in the load tier because changing it rebuilds the
+    # field inside ``DvcDataset.load_pair``.
+    "gt_interpolation": 3,
 }
 
-_LOAD_KEYS: tuple[str, ...] = ("mask", "dry_shape", "flow_convention")
+_LOAD_KEYS: tuple[str, ...] = ("mask", "dry_shape", "flow_convention", "gt_interpolation")
 _GRID_KEYS: tuple[str, ...] = ("window", "overlap")
 _COMPUTE_KEYS: tuple[str, ...] = tuple(
     k for k in _BUILTIN_DEFAULTS if k not in _LOAD_KEYS and k not in _GRID_KEYS
@@ -81,6 +90,7 @@ _SLUG_ABBREV: dict[str, str] = {
     "mask": "m",
     "dry_shape": "dry",
     "flow_convention": "fc",
+    "gt_interpolation": "gti",
 }
 
 _FLOW_CONVENTIONS: frozenset[str] = frozenset({"pull_back", "push_forward"})
@@ -499,6 +509,13 @@ def _normalize_value(key: str, value: Any) -> Any:
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             return int(value)
         raise ValueError(f"'search_radius' must be a positive int or null, got {value!r}")
+
+    if key == "gt_interpolation":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"'gt_interpolation' must be an int in [0, 5], got {value!r}")
+        if value < 0 or value > 5:
+            raise ValueError(f"'gt_interpolation' must be in [0, 5], got {value}")
+        return int(value)
 
     # mask_threshold, overlap, tukey_alpha — float (tukey_alpha may be null).
     if value is None:

@@ -148,7 +148,12 @@ class TestTierSplit:
             sweep={"mask_threshold": [0.5]}, defaults={"flow_convention": "push_forward"}
         )
         (v,) = spec.variants
-        assert set(v.load_params) == {"mask", "dry_shape", "flow_convention"}
+        assert set(v.load_params) == {
+            "mask",
+            "dry_shape",
+            "flow_convention",
+            "gt_interpolation",
+        }
         assert set(v.grid_params) == {"window", "overlap"}
         assert set(v.compute_params) == {
             "mask_threshold",

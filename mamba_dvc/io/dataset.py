@@ -369,6 +369,7 @@ class DvcDataset:
         *,
         mask: MaskSelector = None,
         dry_shape: tuple[int, int, int] | None = None,
+        gt_interpolation: int = 3,
     ) -> EvaluationPair:
         """Materialize ref + def + mask + GT for one ``correlate()`` call.
 
@@ -384,6 +385,12 @@ class DvcDataset:
         dry_shape
             Optional centered-subblock size, applied identically to
             reference, deformed, mask, and GT field.
+        gt_interpolation
+            Spline order for sampling the synthetic ground-truth
+            flow. ``>= 2`` pays a one-time recursive prefilter at
+            field construction (the ``io.gt.spline_filter`` phase);
+            ``<= 1`` skips it. Ignored for entries without a GT
+            (real deformations).
 
         Raises
         ------
@@ -426,6 +433,7 @@ class DvcDataset:
                 axis_order=flow_axis_order,
                 convention=flow_convention,
                 dry_shape=dry_shape,
+                interpolation=gt_interpolation,
             )
 
         return EvaluationPair(
