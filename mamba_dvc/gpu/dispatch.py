@@ -1122,10 +1122,6 @@ class MultiGPUDispatcher:
         self._shards_idx: list[np.ndarray] = []
         self._effective_mask_c: np.ndarray | None = None
         self._anchored_reference_c: np.ndarray | None = None
-        # Per-pair merged buffers (allocated once at __enter__, reset per pair).
-        self._merged_disp: np.ndarray | None = None
-        self._merged_conf: np.ndarray | None = None
-        self._merged_stat: np.ndarray | None = None
         # Multi-process plumbing:
         self._workers: list[Any] = []
         self._send_pipes: list[Connection] = []
@@ -1235,14 +1231,6 @@ class MultiGPUDispatcher:
         self._effective_mask_c = np.ascontiguousarray(eff_mask)
         if self._anchored_reference is not None:
             self._anchored_reference_c = np.ascontiguousarray(self._anchored_reference)
-
-        # Allocate the merged-result buffers once for the dispatcher's
-        # lifetime; ``_dispatch_pair_mp`` resets the slots each pair via
-        # ``.fill(...)`` instead of reallocating ~3 arrays of length
-        # n_points every call.
-        self._merged_disp = np.zeros((n_points, 3), dtype=np.float32)
-        self._merged_conf = np.zeros(n_points, dtype=np.float32)
-        self._merged_stat = np.full(n_points, POIStatus.MASKED, dtype=np.uint8)
 
         try:
             if len(self._device_ids) == 1:
@@ -1391,9 +1379,6 @@ class MultiGPUDispatcher:
         self._workers = []
         self._send_pipes = []
         self._recv_pipes = []
-        self._merged_disp = None
-        self._merged_conf = None
-        self._merged_stat = None
 
     def correlate(
         self,
@@ -1415,7 +1400,10 @@ class MultiGPUDispatcher:
         -------
         DisplacementField
             Same shape and semantics as :func:`correlate_multi_gpu` on
-            equivalent inputs (within float32 noise).
+            equivalent inputs (within float32 noise). The returned field
+            owns its ``displacements``, ``confidence``, and ``status``
+            arrays; callers may hold the result across subsequent
+            ``.correlate(...)`` calls without copying.
 
         Raises
         ------
@@ -1512,16 +1500,14 @@ class MultiGPUDispatcher:
         reference_c: np.ndarray | None,
         deformed_c: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        # Reset the per-pair merged buffers (allocated once at __enter__).
-        assert self._merged_disp is not None
-        assert self._merged_conf is not None
-        assert self._merged_stat is not None
-        merged_disp = self._merged_disp
-        merged_conf = self._merged_conf
-        merged_stat = self._merged_stat
-        merged_disp.fill(0.0)
-        merged_conf.fill(0.0)
-        merged_stat.fill(POIStatus.MASKED)
+        # Allocate per pair so the returned DisplacementField owns its
+        # arrays exclusively; reusing dispatcher-scoped scratch would
+        # alias every field on ``DisplacementSeries.fields`` to the
+        # last call's data. See
+        # ``tests/gpu/test_dispatch.py::test_field_buffers_do_not_alias_across_pairs``.
+        merged_disp = np.zeros((self._n_points, 3), dtype=np.float32)
+        merged_conf = np.zeros(self._n_points, dtype=np.float32)
+        merged_stat = np.full(self._n_points, POIStatus.MASKED, dtype=np.uint8)
 
         # Per-pair SHM lifetime: bracket the publish around send + gather.
         def_shm_obj, def_handle = publish(deformed_c)

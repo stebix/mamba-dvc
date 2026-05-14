@@ -599,3 +599,131 @@ class TestMultiGPUDispatcherInProcess:
                 field = d.correlate(None, deformed)
                 assert field.displacements.shape[1] == 3
             assert d.device_ids == ids_before
+
+
+@pytest.mark.gpu
+class TestMultiGPUDispatcherMultiProcessPersistence:
+    """Persistent multi-process dispatcher returns independent buffers per pair.
+
+    Regression coverage for the buffer-aliasing bug captured in
+    ``docs/triage/multi-gpu-aliasing-bug.md``: ``_dispatch_pair_mp``
+    used to reuse dispatcher-scoped scratch, so every
+    :class:`~mamba_dvc.types.DisplacementField` stored on
+    :class:`~mamba_dvc.types.DisplacementSeries.fields` aliased the
+    last call's data. ``device_ids=[0, 0]`` forces the multi-process
+    path on a single-GPU dev host.
+    """
+
+    @staticmethod
+    def _series(
+        shape: tuple[int, int, int] = (96, 96, 96),
+        shifts: tuple[tuple[float, float, float], ...] = (
+            (0.5, -0.4, 0.3),
+            (1.0, -0.8, 0.6),
+            (1.5, -1.2, 0.9),
+        ),
+        seed: int = 17,
+    ) -> tuple[np.ndarray, tuple[np.ndarray, ...]]:
+        """Shared reference + N deformed volumes from a fixed-seed texture."""
+        ref = make_pair(shape=shape, field=rigid_shift((0.0, 0.0, 0.0)), seed=seed).reference
+        deformeds = tuple(
+            make_pair(shape=shape, field=rigid_shift(shift), seed=seed).deformed
+            for shift in shifts
+        )
+        return ref, deformeds
+
+    @staticmethod
+    def _open_persistent(ref: np.ndarray) -> MultiGPUDispatcher:
+        return MultiGPUDispatcher(
+            device_ids=[0, 0],
+            anchored_reference=ref,
+            window=32,
+            overlap=0.5,
+            search_radius=8,
+            batch_size=32,
+        )
+
+    @pytest.mark.slow
+    def test_field_buffers_do_not_alias_across_pairs(self):
+        # Direct catch: every pair of fields must own disjoint
+        # displacements / confidence / status arrays.
+        ref, deformeds = self._series()
+        with self._open_persistent(ref) as d:
+            fields = tuple(d.correlate(None, dfm) for dfm in deformeds)
+
+        for i in range(len(fields)):
+            for j in range(len(fields)):
+                if i == j:
+                    continue
+                assert not np.shares_memory(
+                    fields[i].displacements, fields[j].displacements
+                ), f"displacements alias between fields[{i}] and fields[{j}]"
+                assert not np.shares_memory(fields[i].confidence, fields[j].confidence), (
+                    f"confidence aliases between fields[{i}] and fields[{j}]"
+                )
+                assert not np.shares_memory(fields[i].status, fields[j].status), (
+                    f"status aliases between fields[{i}] and fields[{j}]"
+                )
+
+    @pytest.mark.slow
+    def test_field_values_persist_after_subsequent_pairs(self):
+        # User-visible symptom: a field handed out by the dispatcher
+        # must not change when the next pair runs.
+        ref, deformeds = self._series()
+        with self._open_persistent(ref) as d:
+            first = d.correlate(None, deformeds[0])
+            snapshot_disp = first.displacements.copy()
+            snapshot_conf = first.confidence.copy()
+            snapshot_stat = first.status.copy()
+            snapshot_valid = first.valid.copy()
+            _ = d.correlate(None, deformeds[1])
+            _ = d.correlate(None, deformeds[2])
+
+        np.testing.assert_array_equal(first.displacements, snapshot_disp)
+        np.testing.assert_array_equal(first.confidence, snapshot_conf)
+        np.testing.assert_array_equal(first.status, snapshot_stat)
+        np.testing.assert_array_equal(first.valid, snapshot_valid)
+
+    @pytest.mark.slow
+    def test_valid_matches_status_for_every_returned_field(self):
+        # ``DisplacementField.valid`` is documented as a convenience
+        # view of ``status == POIStatus.OK``. The alias bug silently
+        # violated it after the first pair. Pin the invariant.
+        ref, deformeds = self._series()
+        with self._open_persistent(ref) as d:
+            fields = tuple(d.correlate(None, dfm) for dfm in deformeds)
+
+        for idx, field in enumerate(fields):
+            np.testing.assert_array_equal(
+                field.valid,
+                field.status == POIStatus.OK,
+                err_msg=f"valid/status disagree on fields[{idx}]",
+            )
+
+    @pytest.mark.slow
+    def test_persistent_dispatcher_matches_single_pair_dispatcher(self):
+        # Value-level pin: a fresh single-pair dispatcher run is the
+        # ground truth. The same pair on a persistent dispatcher must
+        # still match it after two more unrelated pairs run.
+        ref, deformeds = self._series()
+
+        with self._open_persistent(ref) as d_single:
+            f_single = d_single.correlate(None, deformeds[0])
+        f_single_disp = f_single.displacements.copy()
+        f_single_conf = f_single.confidence.copy()
+        f_single_stat = f_single.status.copy()
+
+        with self._open_persistent(ref) as d_persist:
+            f_first = d_persist.correlate(None, deformeds[0])
+            disp_snap = f_first.displacements.copy()
+            conf_snap = f_first.confidence.copy()
+            stat_snap = f_first.status.copy()
+            _ = d_persist.correlate(None, deformeds[1])
+            _ = d_persist.correlate(None, deformeds[2])
+
+        np.testing.assert_allclose(f_first.displacements, f_single_disp, atol=1e-6)
+        np.testing.assert_allclose(f_first.confidence, f_single_conf, atol=1e-6)
+        np.testing.assert_array_equal(f_first.status, f_single_stat)
+        np.testing.assert_allclose(disp_snap, f_single_disp, atol=1e-6)
+        np.testing.assert_allclose(conf_snap, f_single_conf, atol=1e-6)
+        np.testing.assert_array_equal(stat_snap, f_single_stat)
