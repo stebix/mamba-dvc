@@ -53,13 +53,19 @@ def synthetic_store(tmp_path: Path) -> Path:
 
 def test_run_and_evaluate_single_gpu(synthetic_store: Path) -> None:
     """One synthetic entry, one GPU; MAE should sit well under one voxel."""
-    from mamba_dvc.io.dataset import DvcDataset
+    from mamba_dvc.io.dataset import NO_MASK, DvcDataset
     from mamba_dvc.validate.known_fields import run_and_evaluate
 
+    # The shared fixture's "mask" is a uniform Bernoulli(0.5) field, which
+    # never clears the dispatcher's default mask_threshold=0.9 (per-window
+    # fraction stdev ~0.003 around 0.5). Skip the mask entirely — the smoke
+    # test exercises the orchestration chain, not mask-aware admission, and
+    # this fixture mask wouldn't provide meaningful coverage of it either.
     ds = DvcDataset.open(synthetic_store)
     report = run_and_evaluate(
         ds,
         "fs004",
+        mask=NO_MASK,
         device_ids=[0],
         window=32,
         overlap=0.5,
