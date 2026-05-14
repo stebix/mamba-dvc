@@ -74,6 +74,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
+import structlog
 
 from mamba_dvc.gpu.dispatch import correlate_multi_gpu
 from mamba_dvc.instrument import timed
@@ -86,6 +87,17 @@ from mamba_dvc.types import DisplacementField, POIStatus
 from mamba_dvc.validate.known_fields import BoundaryDistanceIndex, ErrorReport, evaluate_pair
 
 __all__ = ["DatasetOpener", "Job", "JobResult", "plan_jobs", "run_batch"]
+
+
+# Structlog logger name shared with :mod:`mamba_dvc.run.eventlog`. Lines
+# emitted on this name land in ``events.jsonl`` when a ``SessionScope``
+# is active; outside one they are silent.
+_EVENTLOG_LOGGER_NAME = "mamba_dvc.eventlog"
+
+# Cap the ``repr(exc)`` payload at ~2 KB to match the existing manifest
+# ``error_tail`` budget — long enough to carry a CUDA error string, short
+# enough that one OOM does not blow up the jsonl line size.
+_EXC_REPR_LIMIT = 2000
 
 
 # An opener maps ``(store_path, flow_convention)`` to an open dataset.
@@ -520,16 +532,28 @@ def _correlate_with_fallback(
         return correlate(
             pair.reference, pair.deformed, mask=pair.mask, device_ids=devices, **kwargs
         )
-    except Exception:
-        # Host pinned-memory exhaustion scales with the worker count;
-        # if the user pinned >2 GPUs, retry on the first two before
-        # giving up. (No fallback when ``devices`` is None — we won't
-        # enumerate the fleet here.)
-        if devices is not None and len(devices) > 2:
-            return correlate(
-                pair.reference, pair.deformed, mask=pair.mask, device_ids=devices[:2], **kwargs
-            )
-        raise
+    except MemoryError as exc:
+        # Host pinned-memory exhaustion scales with the worker count; if
+        # the user pinned >2 GPUs, retry on the first two before giving
+        # up. (No fallback when ``devices`` is None — we won't enumerate
+        # the fleet here.) Any non-``MemoryError`` failure bubbles so a
+        # real bug is not silently masked by the retry. The retry itself
+        # is logged as ``kind:"correlate_retry"`` so an analyst can see
+        # the cost in ``events.jsonl`` without having to infer it from
+        # phase-record patterns.
+        if devices is None or len(devices) <= 2:
+            raise
+        retry_devices = devices[:2]
+        structlog.get_logger(_EVENTLOG_LOGGER_NAME).warning(
+            "correlate_retry",
+            exception_type=type(exc).__name__,
+            exception_repr=repr(exc)[:_EXC_REPR_LIMIT],
+            from_devices=list(devices),
+            to_devices=list(retry_devices),
+        )
+        return correlate(
+            pair.reference, pair.deformed, mask=pair.mask, device_ids=retry_devices, **kwargs
+        )
 
 
 # ----------------------------------------------------------------- prefetch

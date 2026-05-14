@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -661,3 +662,125 @@ class TestStructlogObserver:
         assert kinds.count("batch_start") == 1
         assert kinds.count("batch_end") == 1
         assert kinds.count("job_start") == kinds.count("job_end") == len(sink_results)
+
+
+class TestCorrelateFallback:
+    """Behaviour of the 4-GPU → 2-GPU pinned-memory retry path.
+
+    The fallback exists because pinned-memory exhaustion scales with the
+    GPU worker count; until non-pinned host staging lands in
+    ``gpu.dispatch``, retrying on the first two devices keeps a campaign
+    alive through OOMs. The exception class is narrow on purpose (only
+    ``MemoryError``) so a non-OOM failure is not silently masked, and the
+    retry emits a structured ``kind:"correlate_retry"`` event so an
+    analyst can see the cost without inferring it from phase records.
+    """
+
+    @staticmethod
+    def _variant() -> object:
+        # Duck-typed Variant: only the three params dicts are read by
+        # ``_correlate_with_fallback``.
+        return SimpleNamespace(
+            grid_params={"window": 96, "overlap": 0.5},
+            compute_params={"mask_threshold": 0.9},
+        )
+
+    @staticmethod
+    def _pair() -> object:
+        return _Pair("fs1", "synthetic", _CountingGT())
+
+    def test_memory_error_triggers_retry_on_first_two_devices(self) -> None:
+        from mamba_dvc.run.batch import _correlate_with_fallback
+
+        calls: list[tuple[int, ...] | None] = []
+
+        def fake_correlate(reference, deformed, mask=None, *, device_ids=None, **kwargs):
+            calls.append(device_ids)
+            if len(calls) == 1:
+                raise MemoryError("pinned host alloc failed")
+            return _make_field()
+
+        out = _correlate_with_fallback(
+            fake_correlate, self._pair(), self._variant(), devices=(0, 1, 2, 3)
+        )
+        assert isinstance(out, DisplacementField)
+        assert calls == [(0, 1, 2, 3), (0, 1)]
+
+    def test_non_memory_error_bubbles_without_retry(self) -> None:
+        from mamba_dvc.run.batch import _correlate_with_fallback
+
+        calls: list[tuple[int, ...] | None] = []
+
+        def fake_correlate(reference, deformed, mask=None, *, device_ids=None, **kwargs):
+            calls.append(device_ids)
+            raise RuntimeError("not a memory error")
+
+        with pytest.raises(RuntimeError, match="not a memory error"):
+            _correlate_with_fallback(
+                fake_correlate, self._pair(), self._variant(), devices=(0, 1, 2, 3)
+            )
+        # Exactly one call: no silent retry on non-OOM failures.
+        assert calls == [(0, 1, 2, 3)]
+
+    def test_memory_error_with_devices_none_bubbles(self) -> None:
+        from mamba_dvc.run.batch import _correlate_with_fallback
+
+        calls = 0
+
+        def fake_correlate(reference, deformed, mask=None, *, device_ids=None, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise MemoryError("oom")
+
+        with pytest.raises(MemoryError):
+            _correlate_with_fallback(
+                fake_correlate, self._pair(), self._variant(), devices=None
+            )
+        # devices=None disables the retry (the fleet enumeration lives in
+        # gpu.dispatch, not here).
+        assert calls == 1
+
+    def test_memory_error_with_two_devices_bubbles(self) -> None:
+        from mamba_dvc.run.batch import _correlate_with_fallback
+
+        calls: list[tuple[int, ...] | None] = []
+
+        def fake_correlate(reference, deformed, mask=None, *, device_ids=None, **kwargs):
+            calls.append(device_ids)
+            raise MemoryError("oom")
+
+        with pytest.raises(MemoryError):
+            _correlate_with_fallback(
+                fake_correlate, self._pair(), self._variant(), devices=(0, 1)
+            )
+        # No retry: the fallback target would be the same two GPUs.
+        assert calls == [(0, 1)]
+
+    def test_retry_event_lands_in_events_jsonl(self, tmp_path: Path) -> None:
+        from mamba_dvc.run.batch import _correlate_with_fallback
+        from mamba_dvc.run.eventlog import EventSink
+
+        def fake_correlate(reference, deformed, mask=None, *, device_ids=None, **kwargs):
+            if device_ids == (0, 1, 2, 3):
+                raise MemoryError("pinned host alloc failed: 16 GB")
+            return _make_field()
+
+        with EventSink(tmp_path, campaign="c"):
+            _correlate_with_fallback(
+                fake_correlate, self._pair(), self._variant(), devices=(0, 1, 2, 3)
+            )
+
+        events_path = tmp_path / "events.jsonl"
+        assert events_path.exists()
+        rows = [
+            json.loads(line)
+            for line in events_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        retry_rows = [r for r in rows if r.get("kind") == "correlate_retry"]
+        assert len(retry_rows) == 1
+        retry = retry_rows[0]
+        assert retry["exception_type"] == "MemoryError"
+        assert "pinned host alloc failed" in retry["exception_repr"]
+        assert retry["from_devices"] == [0, 1, 2, 3]
+        assert retry["to_devices"] == [0, 1]
