@@ -30,9 +30,13 @@ import argparse
 import sys
 import time
 from collections.abc import Sequence
+from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+import structlog
+from mamba_dvc.run.eventlog import DispatchLogger, SeriesPairLogger, SessionScope
 from mamba_dvc.types import PairingStrategy, SeriesPairStatus
 from mamba_dvc.validate.series_error import (
     CumulativeDriftTable,
@@ -316,19 +320,65 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         print(f"Mode: persistent  --out={args.out}", flush=True)
 
+    # Persistent runs: open a SessionScope around the whole sweep so
+    # every event (sweep_start / pair_start / pair_end / dispatch_* /
+    # phase records / warnings) lands in events.jsonl under args.out.
+    # Ephemeral runs skip the scope so no file is created. The
+    # ``series`` binding describes the synthetic experiment shape so
+    # multiple runs against the same out dir can be split apart by
+    # df.groupby("series") at analysis time.
+    series_id = f"synthetic-shape{args.shape}-seed{args.seed}-ts{args.timesteps}"
+    if args.ephemeral:
+        scope_cm: Any = nullcontext()
+        pair_observer = None
+        dispatch_observer = None
+    else:
+        args.out.mkdir(parents=True, exist_ok=True)
+        scope_cm = SessionScope(args.out, series=series_id)
+        pair_observer = SeriesPairLogger()
+        # Only thread DispatchLogger through when device_ids is set;
+        # evaluate_synthetic warns (and skips) when it is not.
+        dispatch_observer = DispatchLogger() if args.devices is not None else None
+
     t0 = time.perf_counter()
-    report = evaluate_synthetic(
-        reference,
-        u_of_t,
-        timesteps,
-        strategies=_DEFAULT_STRATEGIES,
-        lags=args.lags,
-        device_ids=args.devices,
-        window=args.window,
-        overlap=args.overlap,
-        warp_order=args.warp_order,
-    )
-    elapsed = time.perf_counter() - t0
+    with scope_cm:
+        # sweep_start / sweep_end are only meaningful when an
+        # events.jsonl is open underneath; in ephemeral mode they
+        # would just leak structlog lines to stderr, duplicating the
+        # print() summary above. Gate on the persistent branch.
+        if not args.ephemeral:
+            eventlog = structlog.get_logger("mamba_dvc.eventlog")
+            eventlog.info(
+                "sweep_start",
+                strategies=[s.value for s in _DEFAULT_STRATEGIES],
+                lags=list(args.lags),
+                timesteps=list(timesteps),
+                shape=list(shape),
+                window=args.window,
+                overlap=args.overlap,
+                devices=list(args.devices) if args.devices is not None else None,
+            )
+        report = evaluate_synthetic(
+            reference,
+            u_of_t,
+            timesteps,
+            strategies=_DEFAULT_STRATEGIES,
+            lags=args.lags,
+            device_ids=args.devices,
+            window=args.window,
+            overlap=args.overlap,
+            warp_order=args.warp_order,
+            pair_observer=pair_observer,
+            dispatch_observer=dispatch_observer,
+        )
+        elapsed = time.perf_counter() - t0
+        if not args.ephemeral:
+            eventlog.info(
+                "sweep_end",
+                duration_s=round(elapsed, 3),
+                n_per_pair_tables=len(report.per_pair),
+                n_cumulative_tables=len(report.cumulative),
+            )
 
     summary = format_summary(report)
     print()
@@ -343,6 +393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     npz_path, md_path = write_outputs(args, report, summary, elapsed)
     print(f"Wrote {npz_path}")
     print(f"Wrote {md_path}")
+    print(f"Wrote {args.out / 'events.jsonl'}")
     return 0
 
 

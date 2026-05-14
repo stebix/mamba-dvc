@@ -10,9 +10,14 @@ tests can assert against.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pytest
-from mamba_dvc.types import PairingStrategy
+from mamba_dvc.run.eventlog import SeriesPairLogger, SessionScope
+from mamba_dvc.types import PairingStrategy, SeriesPairStatus
 from mamba_dvc.validate.series_error import (
     CumulativeDriftTable,
     PerPairErrorTable,
@@ -178,3 +183,119 @@ class TestInputValidation:
                 **_correlator_kwargs(),
             )
         assert (PairingStrategy.SEQUENTIAL, 5) not in report.per_pair
+
+
+def _read_events(path: Path) -> list[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+class TestEventLogging:
+    """L4 wiring: pair_observer / dispatch_observer thread through the sweep."""
+
+    def test_pair_observer_lands_pair_events_with_strategy_and_lag(
+        self, tmp_path: Path, small_reference: np.ndarray
+    ):
+        # The whole point of L4: open a SessionScope, pass a
+        # SeriesPairLogger to evaluate_synthetic, and the resulting
+        # events.jsonl carries a pair_start / pair_end pair per
+        # (strategy, lag, t_ref, t_def). The strategy / lag
+        # contextvars bound by the harness must appear on every row
+        # so a downstream reader can groupby them.
+        u = linear_motion(rigid_shift(_VELOCITY))
+        with SessionScope(tmp_path, series="syn-test"):
+            evaluate_synthetic(
+                small_reference,
+                u,
+                timesteps=[0, 1, 2],
+                lags=(1,),
+                strategies=(
+                    PairingStrategy.REFERENCE_ANCHORED,
+                    PairingStrategy.SEQUENTIAL,
+                ),
+                pair_observer=SeriesPairLogger(),
+                **_correlator_kwargs(),
+            )
+        events = _read_events(tmp_path / "events.jsonl")
+        pair_starts = [e for e in events if e["kind"] == "pair_start"]
+        pair_ends = [e for e in events if e["kind"] == "pair_end"]
+        # 2 strategies x 2 pairs each (timesteps [0,1,2] gives 2 pairs).
+        assert len(pair_starts) == 4
+        assert len(pair_ends) == 4
+        for ev in pair_starts + pair_ends:
+            assert ev["strategy"] in {"REFERENCE_ANCHORED", "SEQUENTIAL"}
+            assert ev["lag"] == 1
+            assert ev["series"] == "syn-test"
+            assert "session_id" in ev
+            assert "t_ref" in ev
+            assert "t_def" in ev
+        # Every pair_end must report status; sweep is on a clean
+        # synthetic so all should be OK.
+        for end in pair_ends:
+            assert end["status"] == SeriesPairStatus.OK.name
+
+    def test_strategy_lag_unbound_after_iteration(
+        self, tmp_path: Path, small_reference: np.ndarray
+    ):
+        # Loop-bound contextvars must not leak past evaluate_synthetic;
+        # otherwise a later event emitted in the same SessionScope
+        # would wrongly inherit the last (strategy, lag) values.
+        u = linear_motion(rigid_shift(_VELOCITY))
+        with SessionScope(tmp_path, series="syn-test"):
+            evaluate_synthetic(
+                small_reference,
+                u,
+                timesteps=[0, 1],
+                pair_observer=SeriesPairLogger(),
+                **_correlator_kwargs(),
+            )
+            # Emit a custom event after the call. It must not carry
+            # strategy / lag — the harness unbound them on the way out.
+            import structlog
+
+            structlog.get_logger("mamba_dvc.eventlog").info("post_sweep_marker")
+        marker = next(
+            e
+            for e in _read_events(tmp_path / "events.jsonl")
+            if e["kind"] == "post_sweep_marker"
+        )
+        assert "strategy" not in marker
+        assert "lag" not in marker
+
+    def test_pair_observer_none_emits_no_events(
+        self, tmp_path: Path, small_reference: np.ndarray
+    ):
+        # Backward-compat: omitting pair_observer (the pre-L4 call
+        # shape) leaves events.jsonl empty even inside a SessionScope.
+        u = linear_motion(rigid_shift(_VELOCITY))
+        with SessionScope(tmp_path, series="syn-test"):
+            evaluate_synthetic(
+                small_reference,
+                u,
+                timesteps=[0, 1, 2],
+                **_correlator_kwargs(),
+            )
+        events = _read_events(tmp_path / "events.jsonl")
+        # No pair_observer => no pair_start / pair_end rows. Phase
+        # records (kind:"phase") may still appear because the timing
+        # logger is at DEBUG inside the SessionScope, but the
+        # observer-driven kinds must be absent.
+        assert not any(e["kind"] == "pair_start" for e in events)
+        assert not any(e["kind"] == "pair_end" for e in events)
+
+    def test_dispatch_observer_without_devices_warns(self, small_reference: np.ndarray):
+        # The host-only path (device_ids=None) does not open a
+        # MultiGPUDispatcher, so a supplied dispatch_observer would
+        # silently never fire. The harness raises a RuntimeWarning to
+        # surface the misconfiguration instead.
+        from mamba_dvc.run.eventlog import DispatchLogger
+
+        u = linear_motion(rigid_shift(_VELOCITY))
+        with pytest.warns(RuntimeWarning, match="dispatch_observer"):
+            evaluate_synthetic(
+                small_reference,
+                u,
+                timesteps=[0, 1, 2],
+                dispatch_observer=DispatchLogger(),
+                **_correlator_kwargs(),
+            )

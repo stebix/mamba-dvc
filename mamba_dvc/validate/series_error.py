@@ -35,15 +35,18 @@ from typing import Any, Literal
 
 import numpy as np
 from jaxtyping import Bool, Float32, Int64, UInt8
+from structlog.contextvars import bind_contextvars, unbind_contextvars
 
 from mamba_dvc.core.grid import build_grid
 from mamba_dvc.gpu.dispatch import MultiGPUDispatcher
 from mamba_dvc.pipeline._internal import NCCMode, NCCNormalization
 from mamba_dvc.pipeline.series import correlate_series
 from mamba_dvc.types import (
+    DispatchObserver,
     DisplacementField,
     DisplacementSeries,
     PairingStrategy,
+    SeriesPairObserver,
     SeriesPairStatus,
 )
 from mamba_dvc.validate.synthetic import make_series, normalize_temporal_form
@@ -171,6 +174,8 @@ def evaluate_synthetic(
     eps: float = 1e-12,
     ncc_mode: NCCMode = NCCMode.LINEAR,
     ncc_normalization: NCCNormalization = NCCNormalization.OVERLAP,
+    pair_observer: SeriesPairObserver | None = None,
+    dispatch_observer: DispatchObserver | None = None,
 ) -> SyntheticEvalReport:
     """Sweep pairing strategies and frame lags on a synthetic series and report errors.
 
@@ -250,6 +255,28 @@ def evaluate_synthetic(
         like-with-like.
     batch_size, eps, ncc_mode, ncc_normalization
         Forwarded to :func:`correlate_series` unchanged.
+    pair_observer
+        Optional :class:`mamba_dvc.types.SeriesPairObserver`. When
+        supplied, every ``correlate_series`` call inside the sweep
+        receives it (one observer per pair across the whole
+        ``(strategy, lag)`` grid) and the harness binds
+        ``strategy`` / ``lag`` contextvars around each iteration so
+        events emitted by the observer (and by phase-record sites
+        downstream) carry the loop coordinates. The function does
+        **not** open a :class:`mamba_dvc.run.eventlog.SessionScope`
+        itself; the caller is expected to bracket the call with one
+        when it wants the observer's events to land in
+        ``events.jsonl``. Default ``None`` keeps the function
+        side-effect free.
+    dispatch_observer
+        Optional :class:`mamba_dvc.types.DispatchObserver` forwarded
+        to the persistent :class:`mamba_dvc.gpu.dispatch.MultiGPUDispatcher`
+        constructed when ``device_ids`` is set. Composes with
+        ``pair_observer`` so per-pair dispatch boundaries inherit
+        the L1-bound ``t_ref`` / ``t_def`` contextvars. Ignored
+        (with a :class:`RuntimeWarning`) when ``device_ids`` is
+        ``None`` because no dispatcher is opened on the host-only
+        path.
 
     Returns
     -------
@@ -349,7 +376,10 @@ def evaluate_synthetic(
     cumulative_out: dict[tuple[PairingStrategy, int], CumulativeDriftTable] = {}
 
     # Open one dispatcher for the whole sweep when device_ids is given;
-    # otherwise the ``correlate_series`` fallback runs on the host.
+    # otherwise the ``correlate_series`` fallback runs on the host. The
+    # dispatch_observer threads through to the dispatcher (when one is
+    # opened) so per-pair dispatch boundaries land in events.jsonl
+    # alongside the SeriesPairLogger rows the pair_observer drives.
     if device_ids is not None:
         dispatcher_cm: Any = MultiGPUDispatcher(
             device_ids=device_ids,
@@ -364,8 +394,17 @@ def evaluate_synthetic(
             eps=eps,
             ncc_mode=ncc_mode,
             ncc_normalization=ncc_normalization,
+            dispatch_observer=dispatch_observer,
         )
     else:
+        if dispatch_observer is not None:
+            warnings.warn(
+                "dispatch_observer was supplied but device_ids is None; the host-only"
+                " path does not open a MultiGPUDispatcher, so the observer will not"
+                " fire. Pass device_ids=... to route correlation through a dispatcher.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         dispatcher_cm = nullcontext(None)
 
     with dispatcher_cm as dispatcher:
@@ -382,32 +421,47 @@ def evaluate_synthetic(
                 continue
 
             for strategy in strategies_tuple:
-                frame_iter = zip(selected_ts, selected_frames, strict=True)
-                series_result = correlate_series(
-                    frame_iter,
-                    mask=mask,
-                    strategy=strategy,
-                    dispatcher=dispatcher,
-                    window=window,
-                    overlap=overlap,
-                    mask_threshold=mask_threshold,
-                    tukey_alpha=tukey_alpha,
-                    search_radius=search_radius,
-                    batch_size=batch_size,
-                    eps=eps,
-                    ncc_mode=ncc_mode,
-                    ncc_normalization=ncc_normalization,
-                )
-
-                per_pair_out[(strategy, lag)] = _per_pair_table(series_result, gt_per_t)
-
-                if strategy is PairingStrategy.SEQUENTIAL:
-                    cumulative_fields = series_result.cumulative(
-                        interpolation=cumulative_interpolation
+                # Bind strategy / lag as contextvars only when a
+                # pair_observer is active. Inside an open SessionScope
+                # this means every event emitted during the iteration
+                # (pair_start / pair_end, dispatch_*, phase records,
+                # warnings) carries the sweep coordinates with no
+                # per-call boilerplate. Without an observer we leave
+                # contextvars alone so the call stays side-effect free.
+                bound_loop_vars = pair_observer is not None
+                if bound_loop_vars:
+                    bind_contextvars(strategy=strategy.name, lag=int(lag))
+                try:
+                    frame_iter = zip(selected_ts, selected_frames, strict=True)
+                    series_result = correlate_series(
+                        frame_iter,
+                        mask=mask,
+                        strategy=strategy,
+                        dispatcher=dispatcher,
+                        pair_observer=pair_observer,
+                        window=window,
+                        overlap=overlap,
+                        mask_threshold=mask_threshold,
+                        tukey_alpha=tukey_alpha,
+                        search_radius=search_radius,
+                        batch_size=batch_size,
+                        eps=eps,
+                        ncc_mode=ncc_mode,
+                        ncc_normalization=ncc_normalization,
                     )
-                    cumulative_out[(strategy, lag)] = _cumulative_table(
-                        cumulative_fields, series_result, gt_per_t
-                    )
+
+                    per_pair_out[(strategy, lag)] = _per_pair_table(series_result, gt_per_t)
+
+                    if strategy is PairingStrategy.SEQUENTIAL:
+                        cumulative_fields = series_result.cumulative(
+                            interpolation=cumulative_interpolation
+                        )
+                        cumulative_out[(strategy, lag)] = _cumulative_table(
+                            cumulative_fields, series_result, gt_per_t
+                        )
+                finally:
+                    if bound_loop_vars:
+                        unbind_contextvars("strategy", "lag")
 
     return SyntheticEvalReport(
         per_pair=per_pair_out,
