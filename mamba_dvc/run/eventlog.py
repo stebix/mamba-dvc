@@ -103,13 +103,15 @@ import logging
 import time
 import uuid
 import warnings
+from collections.abc import MutableMapping
+from datetime import datetime
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Final
 
 import structlog
 from structlog.contextvars import bind_contextvars, clear_contextvars, unbind_contextvars
-from structlog.processors import EventRenamer, JSONRenderer, TimeStamper
+from structlog.processors import EventRenamer, JSONRenderer
 from structlog.stdlib import LoggerFactory, ProcessorFormatter
 
 from mamba_dvc.run._jsonable import to_jsonable
@@ -472,6 +474,21 @@ class Tee:
 # ----------------------------------------------------------------- sink
 
 
+def _local_iso_timestamp(
+    _logger: Any, _method: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    """Stamp ``event_dict["ts"]`` with offset-aware local-time ISO 8601.
+
+    Structlog's ``TimeStamper(fmt="iso", utc=False)`` returns a *naive*
+    ``datetime.now().isoformat()`` (no offset), which makes DST transitions
+    ambiguous. Using ``astimezone()`` attaches the local UTC offset so the
+    timestamp remains unambiguous while reading naturally for a single-site
+    operator.
+    """
+    event_dict["ts"] = datetime.now().astimezone().isoformat()
+    return event_dict
+
+
 def _build_formatter() -> ProcessorFormatter:
     """Build the shared :class:`ProcessorFormatter` used on the file handler.
 
@@ -486,7 +503,7 @@ def _build_formatter() -> ProcessorFormatter:
     """
     foreign_pre_chain: list[Any] = [
         structlog.contextvars.merge_contextvars,
-        TimeStamper(fmt="iso", utc=True, key="ts"),
+        _local_iso_timestamp,
         _promote_mdvc_fields,
     ]
     final_processors: list[Any] = [
@@ -514,7 +531,7 @@ def _configure_structlog() -> None:
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
-            TimeStamper(fmt="iso", utc=True, key="ts"),
+            _local_iso_timestamp,
             ProcessorFormatter.wrap_for_formatter,
         ],
         logger_factory=LoggerFactory(),

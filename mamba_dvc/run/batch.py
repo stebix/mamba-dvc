@@ -69,7 +69,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -1056,7 +1056,7 @@ def _write_config_snapshot(spec: BatchSpec, campaign_dir: Path) -> None:
 
 def _provenance() -> dict[str, Any]:
     return {
-        "timestamp": datetime.now(tz=UTC).isoformat(timespec="seconds"),
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         "host": platform.node(),
         "package_version": _package_version(),
         "git_sha": _git_sha(),
