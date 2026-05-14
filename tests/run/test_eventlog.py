@@ -16,6 +16,7 @@ import pytest
 import structlog
 from mamba_dvc.instrument import accumulating, timed
 from mamba_dvc.run.eventlog import (
+    DispatchLogger,
     EventSink,
     SeriesPairLogger,
     SessionScope,
@@ -553,3 +554,110 @@ class TestSeriesPairLogger:
         )
         assert "t_ref" not in between
         assert "t_def" not in between
+
+
+# --------------------------------------------------------------- dispatch logger
+
+
+class TestDispatchLogger:
+    """Cover the structlog-backed :class:`DispatchObserver`."""
+
+    def test_pair_start_and_pair_end_round_trip(self, tmp_path: Path) -> None:
+        # Canonical observable: one dispatch_pair_start line, one
+        # dispatch_pair_end line, both inheriting the SessionScope
+        # bindings (no contextvar binding inside the logger itself).
+        log = DispatchLogger()
+        with SessionScope(tmp_path, series="rat-103L"):
+            log.on_pair_start(volume_shape=(48, 48, 48))
+            log.on_pair_end(
+                status_counts={POIStatus.OK: 5, POIStatus.MASKED: 3},
+                n_valid=5,
+            )
+        events = _read_events(tmp_path / "events.jsonl")
+        kinds = [e["kind"] for e in events]
+        assert kinds == ["dispatch_pair_start", "dispatch_pair_end"]
+        for ev in events:
+            assert ev["series"] == "rat-103L"
+            assert "session_id" in ev
+
+    def test_pair_start_carries_volume_shape(self, tmp_path: Path) -> None:
+        # volume_shape is the only payload on the start row; rendered as
+        # a JSON array (length 3) so a downstream reader can index it
+        # without a tuple round-trip.
+        log = DispatchLogger()
+        with SessionScope(tmp_path):
+            log.on_pair_start(volume_shape=(960, 1280, 1280))
+            log.on_pair_end(status_counts={POIStatus.OK: 1}, n_valid=1)
+        start = next(
+            e
+            for e in _read_events(tmp_path / "events.jsonl")
+            if e["kind"] == "dispatch_pair_start"
+        )
+        assert start["volume_shape"] == [960, 1280, 1280]
+
+    def test_pair_end_status_counts_use_member_names(self, tmp_path: Path) -> None:
+        # status_counts keys must be POIStatus.name strings, not the
+        # int values — avoids a rehydrate step in the JSONL reader and
+        # keeps the row human-grep-able.
+        log = DispatchLogger()
+        with SessionScope(tmp_path):
+            log.on_pair_start(volume_shape=(8, 8, 8))
+            log.on_pair_end(
+                status_counts={
+                    POIStatus.OK: 7,
+                    POIStatus.MASKED: 2,
+                    POIStatus.OUTLIER: 1,
+                },
+                n_valid=7,
+            )
+        end = next(
+            e
+            for e in _read_events(tmp_path / "events.jsonl")
+            if e["kind"] == "dispatch_pair_end"
+        )
+        assert end["status_counts"] == {"OK": 7, "MASKED": 2, "OUTLIER": 1}
+        assert end["n_valid"] == 7
+
+    def test_empty_status_counts_renders_as_empty_dict(self, tmp_path: Path) -> None:
+        # The dispatcher's _status_histogram omits zero-count members;
+        # an all-empty pair yields {} and DispatchLogger must pass that
+        # through verbatim, not coerce to None or drop the key.
+        log = DispatchLogger()
+        with SessionScope(tmp_path):
+            log.on_pair_start(volume_shape=(4, 4, 4))
+            log.on_pair_end(status_counts={}, n_valid=0)
+        end = next(
+            e
+            for e in _read_events(tmp_path / "events.jsonl")
+            if e["kind"] == "dispatch_pair_end"
+        )
+        assert end["status_counts"] == {}
+        assert end["n_valid"] == 0
+
+    def test_composes_with_series_pair_logger_contextvars(self, tmp_path: Path) -> None:
+        # Composition contract: when a SeriesPairLogger has bound
+        # t_ref / t_def for a pair and the dispatcher fires its hooks
+        # inside that window, both dispatch_pair_* rows must inherit
+        # the temporal coordinates via merge_contextvars. This is the
+        # whole point of the L1+L2 stacking — slice events.jsonl by
+        # (t_ref, t_def) and group every row from the same pair.
+        series_log = SeriesPairLogger()
+        dispatch_log = DispatchLogger()
+        field = _make_displacement_field(n_ok=4, n_total=4)
+        with SessionScope(tmp_path, series="rat-103L"):
+            series_log.on_pair_start(t_ref=2, t_def=3)
+            dispatch_log.on_pair_start(volume_shape=(16, 16, 16))
+            dispatch_log.on_pair_end(status_counts={POIStatus.OK: 4}, n_valid=4)
+            series_log.on_pair_end(t_ref=2, t_def=3, status=SeriesPairStatus.OK, field=field)
+        events = _read_events(tmp_path / "events.jsonl")
+        kinds = [e["kind"] for e in events]
+        assert kinds == [
+            "pair_start",
+            "dispatch_pair_start",
+            "dispatch_pair_end",
+            "pair_end",
+        ]
+        for ev in events:
+            assert ev["t_ref"] == 2
+            assert ev["t_def"] == 3
+            assert ev["series"] == "rat-103L"

@@ -113,10 +113,11 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from mamba_dvc.run.batch import Job, JobResult
-    from mamba_dvc.types import DisplacementField, SeriesPairStatus
+    from mamba_dvc.types import DisplacementField, POIStatus, SeriesPairStatus
 
 
 __all__ = [
+    "DispatchLogger",
     "EventSink",
     "SeriesPairLogger",
     "SessionScope",
@@ -307,6 +308,90 @@ class SeriesPairLogger:
             n_valid=int(field.valid.sum()),
         )
         unbind_contextvars("t_ref", "t_def")
+
+
+# ----------------------------------------------------------------- dispatch observer
+
+
+class DispatchLogger:
+    """Structlog-backed :class:`mamba_dvc.types.DispatchObserver`.
+
+    Brackets every pair the
+    :class:`mamba_dvc.gpu.dispatch.MultiGPUDispatcher` actually runs
+    with explicit ``kind:"dispatch_pair_start"`` /
+    ``kind:"dispatch_pair_end"`` lines so an analyst slicing
+    ``events.jsonl`` sees the dispatch boundary even when the
+    parent-process ``dispatch.*`` phase records are absent (e.g. a run
+    with the ``mamba_dvc.timing`` logger at default ``WARNING``).
+
+    Hook → event ``kind``:
+
+    ============================  ==================
+    Hook                          Emitted ``kind``
+    ============================  ==================
+    ``on_pair_start``             ``dispatch_pair_start``
+    ``on_pair_end``               ``dispatch_pair_end``
+    ============================  ==================
+
+    The ``dispatch_pair_start`` row carries ``volume_shape`` (so the
+    file is self-describing without joining against a separate
+    dispatcher-construction event); ``dispatch_pair_end`` carries
+    ``status_counts`` (a ``{POIStatus.name: count}`` dict, with
+    zero-count statuses omitted) and ``n_valid``.
+
+    Composition with :class:`SeriesPairLogger`
+    ------------------------------------------
+    When both loggers are active under the same
+    :class:`SessionScope` and the dispatcher is driven from
+    :func:`mamba_dvc.pipeline.correlate_series`, every dispatch row
+    inherits the L1-bound ``t_ref`` / ``t_def`` contextvars
+    automatically — the dispatcher's hooks fire while
+    :class:`SeriesPairLogger` is mid-pair. Slicing
+    ``events.jsonl`` by ``(t_ref, t_def)`` then groups
+    ``pair_start`` / ``dispatch_pair_start`` / ``dispatch_pair_end`` /
+    ``pair_end`` together with no ad-hoc bracket inference.
+
+    Usage::
+
+        with SessionScope(out_dir, series="rat-103L"):
+            with MultiGPUDispatcher(
+                volume_shape=ref.shape,
+                mask=mask,
+                device_ids=[0, 1, 2, 3],
+                dispatch_observer=DispatchLogger(),
+            ) as disp:
+                series = correlate_series(
+                    frames,
+                    dispatcher=disp,
+                    pair_observer=SeriesPairLogger(),
+                )
+    """
+
+    def __init__(self) -> None:
+        self._log = structlog.get_logger(_EVENTLOG_LOGGER_NAME)
+
+    def on_pair_start(self, *, volume_shape: tuple[int, int, int]) -> None:
+        """Emit ``kind:"dispatch_pair_start"`` with the bound volume shape."""
+        self._log.info("dispatch_pair_start", volume_shape=list(volume_shape))
+
+    def on_pair_end(
+        self,
+        *,
+        status_counts: dict[POIStatus, int],
+        n_valid: int,
+    ) -> None:
+        """Emit ``kind:"dispatch_pair_end"`` with status_counts + n_valid.
+
+        Keys in ``status_counts`` are stringified to the
+        :class:`POIStatus` member name (``"OK"``, ``"MASKED"``, …)
+        rather than the integer value, so a downstream JSONL reader
+        does not have to rehydrate the enum to interpret the row.
+        """
+        self._log.info(
+            "dispatch_pair_end",
+            status_counts={k.name: int(v) for k, v in status_counts.items()},
+            n_valid=int(n_valid),
+        )
 
 
 # ----------------------------------------------------------------- tee
