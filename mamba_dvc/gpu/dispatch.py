@@ -466,11 +466,16 @@ def _run_helper_on_device(
     caller.
     """
     assert _cp is not None  # guarded by caller
+    # blocking=True forces a synchronous cudaMemcpy and bypasses CuPy's
+    # async pinned-bounce allocator (cudaHostAlloc), which raises
+    # cudaErrorAlreadyMapped on SHM-backed host views in this campaign
+    # (see docs/triage/gpu-oom.md). Outer sync=True already drains the
+    # stream at block exit, so wall time is unchanged.
     with timed("dispatch.h2d", sync=True):
-        ref_dev = _cp.asarray(reference)
-        def_dev = _cp.asarray(deformed)
-        mask_dev = _cp.asarray(mask)
-        def_mask_dev = _cp.asarray(deformed_mask)
+        ref_dev = _cp.asarray(reference, blocking=True)
+        def_dev = _cp.asarray(deformed, blocking=True)
+        mask_dev = _cp.asarray(mask, blocking=True)
+        def_mask_dev = _cp.asarray(deformed_mask, blocking=True)
     grid_dev, admitted_dev = _to_device(grid, admitted_idx)
 
     # ``sync=True`` on the helper block: the inner batched loop only
