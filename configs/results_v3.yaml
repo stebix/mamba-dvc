@@ -34,8 +34,8 @@ campaign: results_v3
 stores:
   # All transduced stores, staged on the Desktop data dir.
   - C:\Users\jstebani\Desktop\dvc-data-storage\103L_Mg5Gd_4w_000.zarr
-  - C:\Users\jstebani\Desktop\dvc-data-storage\5L_PEEK_4w_000.zarr
-  - C:\Users\jstebani\Desktop\dvc-data-storage\5R_Ti_4w_000.zarr
+  #- C:\Users\jstebani\Desktop\dvc-data-storage\5L_PEEK_4w_000.zarr
+  #- C:\Users\jstebani\Desktop\dvc-data-storage\5R_Ti_4w_000.zarr
 
 manifest: null            # per-store discovery (sidecar YAML / embedded .zattrs)
 strict: false             # 5L_PEEK's synthetic/fs402/volume1 is truncated upstream
