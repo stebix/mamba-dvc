@@ -169,6 +169,18 @@ class DisplacementField:
     spacing: tuple[int, int, int]
     window: tuple[int, int, int]
 
+    def __post_init__(self) -> None:
+        """Pin the documented ``valid == (status == OK)`` invariant.
+
+        Caught a buffer-aliasing bug in :class:`MultiGPUDispatcher` where
+        ``valid`` was a fresh array but ``status`` aliased dispatcher
+        scratch (see ``docs/triage/multi-gpu-aliasing-bug.md``). Any
+        future producer that violates the invariant fails loudly at
+        construction instead of silently emitting inconsistent fields.
+        """
+        if not bool(np.array_equal(self.valid, self.status == POIStatus.OK)):
+            raise ValueError("DisplacementField.valid must equal (status == POIStatus.OK)")
+
     def save_npz(self, path: Path | str) -> None:
         """Persist this field to a ``.npz`` archive.
 
