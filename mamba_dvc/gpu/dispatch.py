@@ -38,10 +38,14 @@ regression-tested.
 
 from __future__ import annotations
 
+import logging
+import logging.handlers
 import multiprocessing as mp
+import queue as _queue
 import sys
 import time
 import traceback
+import warnings
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import replace
@@ -49,6 +53,7 @@ from multiprocessing.connection import Connection, wait
 from typing import Any, Literal
 
 import numpy as np
+import structlog
 from jaxtyping import Bool, Float32
 
 from mamba_dvc.core.grid import build_grid, filter_by_mask
@@ -87,10 +92,128 @@ __all__ = ["MultiGPUDispatcher", "correlate_multi_gpu"]
 _AUTO_HEADROOM_FRACTION: float = 0.15
 
 
+# Maximum buffered LogRecords before the worker-side QueueHandler
+# starts dropping. 1024 is generous against ~10s of ncc.* records per
+# pair per worker; an analyst would need a sustained queue-listener
+# stall to overflow.
+_PHASE_QUEUE_MAXSIZE: int = 1024
+
+# Stdlib-logging name the parent listens on; workers forward records
+# tagged with this name so the parent's file handler (attached by
+# :class:`mamba_dvc.run.eventlog.SessionScope`) receives them.
+_TIMING_LOGGER_NAME: str = "mamba_dvc.timing"
+
+
 # Worker -> parent message protocol over a unidirectional Pipe.
 # ("ok", displacements, confidence, status) on success;
 # ("err", repr_exc, traceback, gpu_id) on failure. The parent demuxes
-# on the first tuple element.
+# on the first tuple element. When ``emit_phase_records=True`` the
+# worker additionally sends a final ("dropped", count) message at
+# shutdown so the parent can surface queue-overflow drops as a
+# kind:"warning" line on :meth:`MultiGPUDispatcher.__exit__`.
+
+
+class _WorkerLogFilter(logging.Filter):
+    """Stamp ``mdvc_device_id`` and per-pair context onto every record.
+
+    Workers install one of these on their ``mamba_dvc.timing`` logger so
+    every :func:`mamba_dvc.instrument.log_phase` record carries enough
+    provenance to be sliceable in the parent's ``events.jsonl`` without
+    cross-process contextvar inheritance (which Python's logging does
+    not provide).
+
+    ``device_id`` is the worker's pinned GPU id, immutable for the
+    worker's lifetime. The per-pair context is updated on every
+    ``("pair", ...)`` request the worker services -- it carries
+    whatever :func:`structlog.contextvars.get_contextvars` returned on
+    the parent at pair-dispatch time (typically ``t_ref`` / ``t_def``
+    when :class:`mamba_dvc.run.eventlog.SeriesPairLogger` is active,
+    plus ``session_id`` / ``series`` / ``strategy`` / ... from the
+    surrounding :class:`mamba_dvc.run.eventlog.SessionScope`).
+
+    Setting the prefix to ``mdvc_`` matches
+    :class:`mamba_dvc.instrument` so the parent's
+    :func:`mamba_dvc.run.eventlog._promote_mdvc_fields` strips it
+    uniformly across worker and parent records.
+    """
+
+    def __init__(self, device_id: int) -> None:
+        super().__init__()
+        self._device_id = int(device_id)
+        self._pair_context: dict[str, Any] = {}
+
+    def set_pair_context(self, context: dict[str, Any] | None) -> None:
+        """Replace the per-pair context dict (None clears it)."""
+        self._pair_context = dict(context) if context else {}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Stamp the device id and any per-pair context; always emit."""
+        record.mdvc_device_id = self._device_id
+        for key, value in self._pair_context.items():
+            # `session_id` from a SessionScope is already a record extra
+            # on the parent side via merge_contextvars; we re-stamp it
+            # here on worker records so both sides converge on the same
+            # JSON layout. Pre-existing record attributes (e.g.
+            # mdvc_phase set by log_phase) are not overwritten.
+            attr = f"mdvc_{key}"
+            if not hasattr(record, attr):
+                setattr(record, attr, value)
+        return True
+
+
+class _NonBlockingQueueHandler(logging.handlers.QueueHandler):
+    """:class:`QueueHandler` with non-blocking enqueue + drop counting.
+
+    Stdlib's :class:`logging.handlers.QueueHandler.enqueue` calls
+    ``self.queue.put_nowait(record)`` which raises :class:`queue.Full`
+    on overflow; the default ``handleError`` then writes to stderr.
+    Workers cannot afford either path: ``put_nowait`` blocking would
+    throttle compute, and stderr writes go nowhere on a detached
+    spawn-context worker. This subclass swallows :class:`queue.Full`
+    and increments a thread-local drop counter that the worker reports
+    back to the parent on shutdown.
+    """
+
+    def __init__(self, log_queue: Any) -> None:
+        super().__init__(log_queue)
+        self.drop_count: int = 0
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        """Try to enqueue without blocking; count drops on overflow."""
+        try:
+            self.queue.put_nowait(record)
+        except _queue.Full:
+            self.drop_count += 1
+
+
+class _ForwardingHandler(logging.Handler):
+    """Re-emit records dequeued by the parent listener on a named logger.
+
+    Workers ship :class:`logging.LogRecord` instances through the
+    multiprocessing queue; the parent's :class:`QueueListener` thread
+    dequeues them and routes them through *this* handler, which simply
+    hands the record to a logger by name on the parent side. The named
+    logger's own handlers (notably the
+    :class:`mamba_dvc.run.eventlog.SessionScope` file handler) then
+    write the JSON line.
+
+    Defensive isolation: a malformed record (pickle round-trip
+    breakage, missing fields) cannot tear down the campaign. Failures
+    are swallowed -- one dropped record is recoverable, a crashed
+    listener thread is not.
+    """
+
+    def __init__(self, target_logger_name: str) -> None:
+        super().__init__(level=logging.DEBUG)
+        self._target_name = target_logger_name
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Hand the dequeued record to the named parent-side logger."""
+        # Mirrors the per-record isolation contract on
+        # :class:`mamba_dvc.run.eventlog.Tee`: one bad record may not
+        # tear down the listener thread.
+        with suppress(Exception):  # pragma: no cover - defensive
+            logging.getLogger(self._target_name).handle(record)
 
 
 def _shard_admitted_indices(
@@ -797,14 +920,18 @@ def correlate_multi_gpu(
 # batch) into ``__enter__`` so each ``.correlate(...)`` call is compute-only.
 #
 # Worker protocol on the duplex pipes:
-#     parent -> worker  ("pair", deformed_handle, ref_handle | None)
+#     parent -> worker  ("pair", deformed_handle, ref_handle | None, pair_context | None)
 #     parent -> worker  ("shutdown",)
 #     worker -> parent  ("ready",)                       (one-time, on enter)
 #     worker -> parent  ("ok", disp_host, conf_host, stat_host)
 #     worker -> parent  ("err", repr_exc, traceback)
+#     worker -> parent  ("dropped", count)               (one-time, on shutdown;
+#                                                         only when emit_phase_records=True)
 #
-# Per-pair payload only ships the new SHM handles; mask, anchored reference
-# (if any), grid, shard_idx and helper_kwargs are bound at worker startup.
+# Per-pair payload only ships the new SHM handles plus an optional
+# pair_context dict (forwarded from the parent's contextvars when
+# ``emit_phase_records=True``); mask, anchored reference (if any),
+# grid, shard_idx and helper_kwargs are bound at worker startup.
 
 
 def _serve_worker(
@@ -816,6 +943,7 @@ def _serve_worker(
     helper_kwargs: dict[str, Any],
     request_recv: Connection,
     result_send: Connection,
+    log_queue: Any | None = None,
 ) -> None:
     """Serve dispatcher pair requests on ``gpu_id`` until shutdown.
 
@@ -825,6 +953,23 @@ def _serve_worker(
     loop failures send a single ``("err", ...)`` and exit; per-pair
     failures send ``("err", ...)`` and continue serving so the parent
     can surface a single pair failure without tearing down the pool.
+
+    Parameters
+    ----------
+    log_queue
+        Optional multiprocessing-Queue forwarded by the parent when
+        ``emit_phase_records=True`` is set on the dispatcher. When
+        supplied, a non-blocking :class:`_NonBlockingQueueHandler` is
+        installed on the worker's ``mamba_dvc.timing`` logger with a
+        :class:`_WorkerLogFilter` stamping ``mdvc_device_id`` (plus the
+        per-pair context dict forwarded on each ``"pair"`` message)
+        onto every record. Phase records emitted by
+        :func:`mamba_dvc.instrument.log_phase` inside
+        :func:`mamba_dvc.pipeline._internal.correlate_admitted_subset`
+        flow through this queue to the parent's listener. On shutdown
+        the worker sends one final ``("dropped", count)`` message
+        carrying the number of records lost to queue overflow, so the
+        parent can surface the count as a ``kind:"warning"`` line.
 
     Notes
     -----
@@ -838,10 +983,26 @@ def _serve_worker(
     the dispatcher's ``__enter__`` will need to forbid that variation.
     """
     resident_shm: list[Any] = []
+    queue_handler: _NonBlockingQueueHandler | None = None
+    log_filter: _WorkerLogFilter | None = None
     try:
         import cupy as cp  # pyright: ignore[reportMissingImports]
 
         cp.cuda.Device(gpu_id).use()
+
+        # Install the worker-side logging bridge *before* attaching SHM
+        # / pinning the device so the helper's phase records (which
+        # fire from correlate_admitted_subset below) are captured. The
+        # timing logger must be at DEBUG for log_phase() to emit
+        # anything -- workers inherit no parent logging config under
+        # spawn, so we set it explicitly.
+        if log_queue is not None:
+            log_filter = _WorkerLogFilter(device_id=gpu_id)
+            queue_handler = _NonBlockingQueueHandler(log_queue)
+            queue_handler.addFilter(log_filter)
+            timing_logger = logging.getLogger(_TIMING_LOGGER_NAME)
+            timing_logger.setLevel(logging.DEBUG)
+            timing_logger.addHandler(queue_handler)
 
         mask_shm, mask_view = attach(mask_handle)
         resident_shm.append(mask_shm)
@@ -861,6 +1022,7 @@ def _serve_worker(
     except Exception as exc:
         with suppress(Exception):
             result_send.send(("err", repr(exc), traceback.format_exc()))
+        _teardown_worker_logging(queue_handler, log_queue)
         for shm in resident_shm:
             with suppress(Exception):
                 shm.close()
@@ -874,6 +1036,7 @@ def _serve_worker(
         result_send.send(("ready",))
     except Exception:
         # Parent died before handshake. Bail without serving.
+        _teardown_worker_logging(queue_handler, log_queue)
         for shm in resident_shm:
             with suppress(Exception):
                 shm.close()
@@ -897,7 +1060,17 @@ def _serve_worker(
                 result_send.send(("err", f"unknown message type {msg[0]!r}", ""))
                 continue
 
-            _, deformed_handle, ref_handle = msg
+            # Pair tuple is 4-wide post-L3 (pair_context as the 4th
+            # slot); older 3-tuples are accepted defensively so a stale
+            # caller does not crash the worker.
+            if len(msg) >= 4:
+                _, deformed_handle, ref_handle, pair_context = msg[0], msg[1], msg[2], msg[3]
+            else:
+                _, deformed_handle, ref_handle = msg
+                pair_context = None
+            if log_filter is not None:
+                log_filter.set_pair_context(pair_context)
+
             per_pair_shm: list[Any] = []
             try:
                 def_shm, def_view = attach(deformed_handle)
@@ -934,10 +1107,23 @@ def _serve_worker(
                 # surfaces this as a single failed pair to the driver.
                 result_send.send(("err", repr(exc), traceback.format_exc()))
             finally:
+                if log_filter is not None:
+                    log_filter.set_pair_context(None)
                 for shm in per_pair_shm:
                     with suppress(Exception):
                         shm.close()
     finally:
+        # Order matters: detach + flush the log queue BEFORE sending
+        # the final ("dropped", ...) so the parent's drop-count recv
+        # is the synchronisation point that guarantees all worker
+        # records have reached the OS pipe. Without the
+        # close+join_thread the queue's feeder may still hold records
+        # in its local buffer when the process exits.
+        drop_count = queue_handler.drop_count if queue_handler is not None else 0
+        _teardown_worker_logging(queue_handler, log_queue)
+        if log_queue is not None:
+            with suppress(Exception):
+                result_send.send(("dropped", int(drop_count)))
         for shm in resident_shm:
             with suppress(Exception):
                 shm.close()
@@ -945,6 +1131,34 @@ def _serve_worker(
             request_recv.close()
         with suppress(Exception):
             result_send.close()
+
+
+def _teardown_worker_logging(
+    queue_handler: _NonBlockingQueueHandler | None,
+    log_queue: Any | None,
+) -> None:
+    """Detach the worker's QueueHandler and flush the queue feeder thread.
+
+    Called from every exit path in :func:`_serve_worker` (pre-loop
+    failure, post-handshake parent-death, normal shutdown). Suppresses
+    every step's exceptions independently because teardown must not
+    raise on a worker that is already dying.
+    """
+    if queue_handler is None:
+        return
+    with suppress(Exception):
+        logging.getLogger(_TIMING_LOGGER_NAME).removeHandler(queue_handler)
+    with suppress(Exception):
+        queue_handler.close()
+    # close + join_thread flush the local buffer through to the OS
+    # pipe so the parent listener actually sees the records the worker
+    # produced. Without these the records still live in the worker
+    # process's queue.Queue and are lost on process exit.
+    if log_queue is not None:
+        with suppress(Exception):
+            log_queue.close()
+        with suppress(Exception):
+            log_queue.join_thread()
 
 
 class MultiGPUDispatcher:
@@ -1040,6 +1254,24 @@ class MultiGPUDispatcher:
         ``t_ref`` / ``t_def`` contextvars; see the Protocol docstring
         for the full ordering. Default ``None`` keeps the dispatcher
         side-effect free.
+    emit_phase_records
+        When ``True`` and the dispatcher runs in multi-process mode
+        (``len(device_ids) > 1``), each worker installs a non-blocking
+        :class:`logging.handlers.QueueHandler` on its
+        ``mamba_dvc.timing`` logger so per-batch ``ncc.*`` phase
+        records (otherwise dropped on the floor under ``spawn``) reach
+        the parent's listener and land in the
+        :class:`mamba_dvc.run.eventlog.SessionScope` events file
+        alongside parent-side ``dispatch.*`` records. Every worker
+        record is tagged with ``mdvc_device_id`` plus whatever
+        :func:`structlog.contextvars.get_contextvars` returns on the
+        parent at pair-dispatch time (typically ``t_ref`` / ``t_def``
+        when :class:`mamba_dvc.run.eventlog.SeriesPairLogger` is
+        active, plus ``session_id`` from the surrounding
+        :class:`SessionScope`). Default ``False`` keeps the dispatcher's
+        multi-process behavior bit-identical to pre-L3; the single-GPU
+        in-process path is unaffected either way (phase records there
+        already flow through the parent's logging tree).
 
     Raises
     ------
@@ -1069,6 +1301,7 @@ class MultiGPUDispatcher:
         ncc_mode: NCCMode = NCCMode.LINEAR,
         ncc_normalization: NCCNormalization = NCCNormalization.OVERLAP,
         dispatch_observer: DispatchObserver | None = None,
+        emit_phase_records: bool = False,
     ) -> None:
         # Resolve volume shape: explicit > mask > anchored_reference.
         inferred_shape: tuple[int, int, int] | None = None
@@ -1140,6 +1373,7 @@ class MultiGPUDispatcher:
         self._ncc_mode = ncc_mode
         self._ncc_normalization = ncc_normalization
         self._dispatch_observer = dispatch_observer
+        self._emit_phase_records = bool(emit_phase_records)
 
         # Lifecycle flag.
         self._opened = False
@@ -1159,6 +1393,13 @@ class MultiGPUDispatcher:
         self._recv_pipes: list[Connection] = []
         self._mask_shm_obj: Any = None
         self._anch_shm_obj: Any = None
+        # Worker-phase-record bridge (L3); only populated when
+        # ``emit_phase_records=True`` AND the dispatcher opens a
+        # multi-process pool. The single-process path leaves these None
+        # because phase records flow through the parent's logging tree
+        # natively in that case.
+        self._log_queue: Any | None = None
+        self._log_listener: logging.handlers.QueueListener | None = None
         # In-process plumbing (deformed mask shares the reference mask
         # buffer in v1; a separate slot lands when per-frame deformed
         # masks become a real feature).
@@ -1312,6 +1553,27 @@ class MultiGPUDispatcher:
             self._anch_shm_obj = anch_shm
 
         ctx = mp.get_context("spawn")
+
+        # L3 worker-phase-record bridge. Created here -- before workers
+        # spawn, so the queue object is picklable to each child -- and
+        # only when the dispatcher was opted in via emit_phase_records.
+        # The listener runs in its own daemon thread on the parent and
+        # forwards every dequeued record to the parent's
+        # ``mamba_dvc.timing`` logger; the SessionScope file handler
+        # (when active) then writes one events.jsonl line per record.
+        # Each record carries ``mdvc_*`` extras stamped on the worker
+        # side -- contextvars do not propagate across the worker /
+        # listener-thread boundary, so pair context is forwarded
+        # explicitly on the pair request payload.
+        if self._emit_phase_records:
+            self._log_queue = ctx.Queue(maxsize=_PHASE_QUEUE_MAXSIZE)
+            self._log_listener = logging.handlers.QueueListener(
+                self._log_queue,
+                _ForwardingHandler(_TIMING_LOGGER_NAME),
+                respect_handler_level=False,
+            )
+            self._log_listener.start()
+
         for gpu_id, shard_idx in zip(self._device_ids, shards, strict=True):
             req_recv, req_send = ctx.Pipe(duplex=False)
             res_recv, res_send = ctx.Pipe(duplex=False)
@@ -1326,6 +1588,7 @@ class MultiGPUDispatcher:
                     dict(self._helper_kwargs),
                     req_recv,
                     res_send,
+                    self._log_queue,
                 ),
             )
             proc.start()
@@ -1384,10 +1647,49 @@ class MultiGPUDispatcher:
         self._inproc_admitted_dev = None
 
     def _exit_multiprocess(self) -> None:
-        """Send shutdown to every worker, join with timeout, terminate on hang."""
+        """Send shutdown to every worker, join with timeout, terminate on hang.
+
+        When ``emit_phase_records=True`` was set, each worker sends one
+        final ``("dropped", count)`` message on its result pipe before
+        exiting its serve loop -- this is the synchronisation point
+        that guarantees the worker's queue feeder has flushed every
+        record into the OS pipe by the time the listener reads it.
+        Non-zero counts are surfaced as one ``RuntimeWarning`` per
+        worker, which :class:`mamba_dvc.run.eventlog.SessionScope`
+        renders as a ``kind:"warning"`` line in ``events.jsonl``.
+        """
         for pipe in self._send_pipes:
             with suppress(Exception):
                 pipe.send(("shutdown",))
+
+        # Collect drop counts BEFORE closing pipes / stopping the
+        # listener. The recv blocks until each worker has flushed its
+        # log queue and sent the count, which orders all phase records
+        # ahead of the listener.stop() drain below.
+        drop_counts: dict[int, int] = {}
+        if self._log_queue is not None:
+            for gpu_id, recv in zip(self._device_ids, self._recv_pipes, strict=True):
+                try:
+                    msg = recv.recv()
+                except Exception:
+                    # Worker died before sending the final count;
+                    # nothing to surface, continue teardown.
+                    continue
+                if isinstance(msg, tuple) and msg and msg[0] == "dropped":
+                    with suppress(Exception):
+                        drop_counts[int(gpu_id)] = int(msg[1])
+
+        if self._log_listener is not None:
+            with suppress(Exception):
+                self._log_listener.stop()
+            self._log_listener = None
+        if self._log_queue is not None:
+            with suppress(Exception):
+                self._log_queue.close()
+            with suppress(Exception):
+                self._log_queue.join_thread()
+            self._log_queue = None
+
         for pipe in self._send_pipes:
             with suppress(Exception):
                 pipe.close()
@@ -1401,12 +1703,34 @@ class MultiGPUDispatcher:
                     proc.terminate()
                 proc.join(timeout=5)
 
+        for gpu_id, count in drop_counts.items():
+            if count > 0:
+                warnings.warn(
+                    f"MultiGPUDispatcher: worker on GPU {gpu_id} dropped "
+                    f"{count} phase records due to log-queue overflow "
+                    f"(maxsize={_PHASE_QUEUE_MAXSIZE})",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
     def _cleanup_state(self) -> None:
         """Unpublish SHM and clear plumbing state. Idempotent."""
         _release_shm(self._mask_shm_obj)
         _release_shm(self._anch_shm_obj)
         self._mask_shm_obj = None
         self._anch_shm_obj = None
+        # Defensive fallthrough: _exit_multiprocess normally stops + clears
+        # these; if it raised partway through they may still be live.
+        if self._log_listener is not None:
+            with suppress(Exception):
+                self._log_listener.stop()
+            self._log_listener = None
+        if self._log_queue is not None:
+            with suppress(Exception):
+                self._log_queue.close()
+            with suppress(Exception):
+                self._log_queue.join_thread()
+            self._log_queue = None
         self._workers = []
         self._send_pipes = []
         self._recv_pipes = []
@@ -1549,6 +1873,19 @@ class MultiGPUDispatcher:
         merged_conf = np.zeros(self._n_points, dtype=np.float32)
         merged_stat = np.full(self._n_points, POIStatus.MASKED, dtype=np.uint8)
 
+        # Snapshot the parent's bound contextvars at pair-dispatch
+        # time so each worker can stamp them onto every record it
+        # emits during this pair. Done before the SHM publishes so the
+        # snapshot is the contextvars at the start of the pair window
+        # (typically: ``t_ref`` / ``t_def`` bound by the L1
+        # :class:`SeriesPairLogger`, ``session_id`` + ``series`` /
+        # ``strategy`` / ``lag`` from the surrounding
+        # :class:`SessionScope`). When ``emit_phase_records`` is off
+        # we pass ``None`` so the worker skips the stamping work.
+        pair_context: dict[str, Any] | None = None
+        if self._emit_phase_records:
+            pair_context = dict(structlog.contextvars.get_contextvars())
+
         # Per-pair SHM lifetime: bracket the publish around send + gather.
         def_shm_obj, def_handle = publish(deformed_c)
         ref_shm_obj: Any = None
@@ -1558,7 +1895,7 @@ class MultiGPUDispatcher:
                 ref_shm_obj, ref_handle = publish(reference_c)
 
             for pipe in self._send_pipes:
-                pipe.send(("pair", def_handle, ref_handle))
+                pipe.send(("pair", def_handle, ref_handle, pair_context))
 
             pipe_to_meta: dict[Connection, tuple[int, np.ndarray]] = {
                 recv: (gid, shard)

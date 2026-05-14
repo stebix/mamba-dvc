@@ -81,13 +81,19 @@ emitted from the loader thread would land without ``store`` /
 :func:`structlog.contextvars.merge_contextvars` runs at format time in
 the emitting thread.
 
-Worker-subprocess gap (deferred)
---------------------------------
-``gpu.dispatch`` workers still don't propagate their ``ncc.*`` records
-to the parent's logging configuration (see
-:mod:`mamba_dvc.instrument`). The file format is forward-compatible: a
-future ``multiprocessing.Queue`` + ``QueueListener`` bridge would land
-those records as more ``kind:"phase"`` lines without schema change.
+Worker-subprocess bridge
+------------------------
+:class:`~mamba_dvc.gpu.dispatch.MultiGPUDispatcher` propagates its
+worker ``ncc.*`` records to the parent's logging tree via a
+:class:`multiprocessing.Queue` + :class:`logging.handlers.QueueListener`
+bridge, gated on the dispatcher's ``emit_phase_records`` flag (default
+off; opt in from the harness). Workers stamp ``mdvc_device_id`` plus
+the parent's ``get_contextvars`` snapshot on every record so the
+listener thread, which has no contextvars of its own, still produces
+JSON lines carrying the originating ``device_id`` and the L1-bound
+``t_ref`` / ``t_def`` / ``session_id`` inline. Queue overflow is
+swallowed worker-side and surfaced as one ``kind:"warning"`` line per
+worker on dispatcher exit -- defensive, never campaign-fatal.
 """
 
 from __future__ import annotations

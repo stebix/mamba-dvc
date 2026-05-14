@@ -11,7 +11,11 @@ seam (helper return contract + per-shard scatter).
 
 from __future__ import annotations
 
+import json
+import logging
+import multiprocessing as mp
 from itertools import pairwise
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -19,11 +23,14 @@ import pytest
 from mamba_dvc.core.grid import build_grid
 from mamba_dvc.gpu.dispatch import (
     MultiGPUDispatcher,
+    _NonBlockingQueueHandler,
     _shard_admitted_indices,
     _status_histogram,
+    _WorkerLogFilter,
     correlate_multi_gpu,
 )
 from mamba_dvc.pipeline.correlate import correlate
+from mamba_dvc.run.eventlog import SessionScope
 from mamba_dvc.types import POIStatus
 from mamba_dvc.validate.synthetic import make_pair, rigid_shift
 
@@ -159,6 +166,105 @@ class TestStatusHistogram:
         counts = _status_histogram(status)
         for k in counts:
             assert isinstance(k, POIStatus)
+
+
+def _make_phase_record(name: str = "mamba_dvc.timing") -> logging.LogRecord:
+    """Build a minimal LogRecord that mimics what ``log_phase`` emits.
+
+    The worker-side filter / handler stamp extras on top of a record;
+    we don't need a full ``logging.makeLogRecord`` round-trip for unit
+    coverage of the stamping/overflow contracts.
+    """
+    return logging.LogRecord(
+        name=name,
+        level=logging.DEBUG,
+        pathname=__file__,
+        lineno=0,
+        msg="phase=test.phase dt=0.0010s",
+        args=None,
+        exc_info=None,
+    )
+
+
+class TestWorkerLogFilter:
+    """Pure-logic coverage for the L3 worker-side log filter. No GPU needed."""
+
+    def test_stamps_device_id_on_every_record(self):
+        # The device_id is bound at filter construction (pinned per
+        # worker process) and must surface on every record so the
+        # listener's events.jsonl line carries the originating GPU.
+        f = _WorkerLogFilter(device_id=2)
+        record = _make_phase_record()
+        assert f.filter(record) is True
+        assert record.mdvc_device_id == 2
+
+    def test_set_pair_context_stamps_every_key(self):
+        # Pair-context dict flows from the parent on each pair
+        # request; the filter copies each entry to ``mdvc_<key>`` so
+        # ``_promote_mdvc_fields`` on the parent side strips the
+        # prefix into a top-level events.jsonl field.
+        f = _WorkerLogFilter(device_id=0)
+        f.set_pair_context({"t_ref": 3, "t_def": 5, "session_id": "abc"})
+        record = _make_phase_record()
+        assert f.filter(record) is True
+        assert record.mdvc_t_ref == 3
+        assert record.mdvc_t_def == 5
+        assert record.mdvc_session_id == "abc"
+
+    def test_set_pair_context_to_none_clears_previous(self):
+        # End-of-pair cleanup: workers call set_pair_context(None) in
+        # the per-pair finally block so the *next* pair's records
+        # don't inherit the previous pair's coords.
+        f = _WorkerLogFilter(device_id=0)
+        f.set_pair_context({"t_ref": 7})
+        f.set_pair_context(None)
+        record = _make_phase_record()
+        f.filter(record)
+        assert not hasattr(record, "mdvc_t_ref")
+
+    def test_does_not_overwrite_existing_mdvc_attrs(self):
+        # ``log_phase`` already puts ``mdvc_phase`` / ``mdvc_seconds`` on
+        # the record. The filter must not clobber them when a pair
+        # context happens to share a key.
+        f = _WorkerLogFilter(device_id=0)
+        f.set_pair_context({"phase": "should_not_overwrite"})
+        record = _make_phase_record()
+        record.mdvc_phase = "ncc.fft_ref"
+        f.filter(record)
+        assert record.mdvc_phase == "ncc.fft_ref"
+
+
+class TestNonBlockingQueueHandler:
+    """Worker-side overflow contract for the L3 queue bridge. No GPU needed."""
+
+    def test_drops_on_full_and_counts(self):
+        # Maxsize=1: first put fills it; second put would block under
+        # the stdlib QueueHandler default, but this subclass swallows
+        # queue.Full and increments the counter so the worker compute
+        # path is never throttled.
+        q: Any = mp.get_context("spawn").Queue(maxsize=1)
+        handler = _NonBlockingQueueHandler(q)
+        for _ in range(3):
+            handler.emit(_make_phase_record())
+        # Two records were rejected; one made it into the queue.
+        assert handler.drop_count == 2
+        # The single buffered record is still readable; emit() did not
+        # corrupt the queue.
+        msg = q.get_nowait()
+        assert isinstance(msg, logging.LogRecord)
+        # Drain the queue and join the feeder so pytest's reaper
+        # doesn't trip on a still-running daemon thread.
+        q.close()
+        q.join_thread()
+
+    def test_no_drops_when_under_capacity(self):
+        q: Any = mp.get_context("spawn").Queue(maxsize=8)
+        handler = _NonBlockingQueueHandler(q)
+        for _ in range(4):
+            handler.emit(_make_phase_record())
+        assert handler.drop_count == 0
+        q.close()
+        q.join_thread()
 
 
 def _assert_fields_match(a, b, *, atol_disp: float = 1e-5, atol_conf: float = 1e-5) -> None:
@@ -579,6 +685,30 @@ class TestMultiGPUDispatcherValidation:
         d = MultiGPUDispatcher(device_ids=[0], volume_shape=(16, 16, 16), window=8)
         assert d._dispatch_observer is None
 
+    def test_emit_phase_records_defaults_to_false(self):
+        # L3 contract: bit-identical pre-L3 multi-process behavior
+        # when the flag is omitted. The dispatcher must not allocate
+        # the queue / start a listener thread until explicitly opted
+        # in.
+        d = MultiGPUDispatcher(device_ids=[0], volume_shape=(16, 16, 16), window=8)
+        assert d._emit_phase_records is False
+        assert d._log_queue is None
+        assert d._log_listener is None
+
+    def test_emit_phase_records_stored_when_set(self):
+        d = MultiGPUDispatcher(
+            device_ids=[0],
+            volume_shape=(16, 16, 16),
+            window=8,
+            emit_phase_records=True,
+        )
+        assert d._emit_phase_records is True
+        # Queue/listener stay None until __enter__ (and only when the
+        # opened dispatcher routes to multi-process); the constructor
+        # does not allocate IPC primitives.
+        assert d._log_queue is None
+        assert d._log_listener is None
+
 
 @pytest.mark.gpu
 class TestMultiGPUDispatcherInProcess:
@@ -870,3 +1000,165 @@ class TestMultiGPUDispatcherMultiProcessPersistence:
         np.testing.assert_allclose(disp_snap, f_single_disp, atol=1e-6)
         np.testing.assert_allclose(conf_snap, f_single_conf, atol=1e-6)
         np.testing.assert_array_equal(stat_snap, f_single_stat)
+
+
+def _read_events(path: Path) -> list[dict[str, Any]]:
+    """Parse an ``events.jsonl`` into a list of dicts. Mirrors test_eventlog.py."""
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+@pytest.mark.gpu
+class TestMultiGPUDispatcherEventLogging:
+    """L3 worker-phase-record bridge: worker ``ncc.*`` records reach events.jsonl.
+
+    Uses ``device_ids=[0, 0]`` to force the multi-process path on a
+    single-GPU host (same trick the persistence regression suite
+    uses). Each worker installs its own QueueHandler so the bridge
+    machinery is exercised end-to-end even on dev hosts with one
+    physical GPU.
+    """
+
+    @staticmethod
+    def _smooth_pair(
+        shape: tuple[int, int, int] = (48, 48, 48),
+        shift: tuple[float, float, float] = (0.5, -0.4, 0.3),
+        seed: int = 17,
+    ):
+        pair = make_pair(shape=shape, field=rigid_shift(shift), seed=seed)
+        return pair.reference, pair.deformed
+
+    @pytest.mark.slow
+    def test_worker_phase_records_propagate(self, tmp_path: Path):
+        # End-to-end: open a SessionScope, run one pair through a
+        # 2-worker multi-process dispatcher with emit_phase_records=True,
+        # and assert at least one kind:"phase" row with phase starting
+        # "ncc." and a top-level device_id field landed in events.jsonl.
+        # Pre-L3 this would have been impossible — worker records were
+        # dropped on the floor under spawn.
+        ref, deformed = self._smooth_pair()
+        kwargs = dict(window=24, overlap=0.5, search_radius=8, batch_size=64)
+
+        with (
+            SessionScope(tmp_path, series="test"),
+            MultiGPUDispatcher(
+                device_ids=[0, 0],
+                anchored_reference=ref,
+                emit_phase_records=True,
+                **kwargs,
+            ) as d,
+        ):
+            d.correlate(None, deformed)
+
+        events = _read_events(tmp_path / "events.jsonl")
+        ncc_phases = [
+            e
+            for e in events
+            if e.get("kind") == "phase" and str(e.get("phase", "")).startswith("ncc.")
+        ]
+        assert ncc_phases, "no worker ncc.* phase rows reached events.jsonl"
+        for row in ncc_phases:
+            assert "device_id" in row, f"phase row missing device_id: {row}"
+            assert isinstance(row["device_id"], int)
+
+    @pytest.mark.slow
+    def test_worker_phase_records_carry_pair_context(self, tmp_path: Path):
+        # When SeriesPairLogger (or any caller) has bound t_ref/t_def
+        # at pair-dispatch time, the dispatcher forwards them on the
+        # pair-request payload and the worker filter stamps them as
+        # mdvc_t_ref / mdvc_t_def on every record — so the events.jsonl
+        # phase row is joinable to the originating pair on (t_ref, t_def)
+        # with no ad-hoc bracketing.
+        from structlog.contextvars import bind_contextvars, unbind_contextvars
+
+        ref, deformed = self._smooth_pair()
+        kwargs = dict(window=24, overlap=0.5, search_radius=8, batch_size=64)
+
+        with (
+            SessionScope(tmp_path, series="test"),
+            MultiGPUDispatcher(
+                device_ids=[0, 0],
+                anchored_reference=ref,
+                emit_phase_records=True,
+                **kwargs,
+            ) as d,
+        ):
+            bind_contextvars(t_ref=7, t_def=11)
+            try:
+                d.correlate(None, deformed)
+            finally:
+                unbind_contextvars("t_ref", "t_def")
+
+        events = _read_events(tmp_path / "events.jsonl")
+        ncc_phases = [
+            e
+            for e in events
+            if e.get("kind") == "phase" and str(e.get("phase", "")).startswith("ncc.")
+        ]
+        assert ncc_phases
+        for row in ncc_phases:
+            assert row.get("t_ref") == 7
+            assert row.get("t_def") == 11
+
+    @pytest.mark.slow
+    def test_default_flag_off_omits_worker_records(self, tmp_path: Path):
+        # Pre-L3 contract pin: with emit_phase_records=False (the
+        # default), the events.jsonl must NOT carry ncc.* rows — the
+        # bit-identical-by-default promise.
+        ref, deformed = self._smooth_pair()
+        kwargs = dict(window=24, overlap=0.5, search_radius=8, batch_size=64)
+
+        with (
+            SessionScope(tmp_path, series="test"),
+            MultiGPUDispatcher(
+                device_ids=[0, 0],
+                anchored_reference=ref,
+                **kwargs,
+            ) as d,
+        ):
+            d.correlate(None, deformed)
+
+        events = _read_events(tmp_path / "events.jsonl")
+        ncc_phases = [
+            e
+            for e in events
+            if e.get("kind") == "phase" and str(e.get("phase", "")).startswith("ncc.")
+        ]
+        assert not ncc_phases, f"unexpected worker rows leaked with flag off: {ncc_phases}"
+
+    @pytest.mark.slow
+    def test_queue_overflow_surfaces_warning_on_exit(self, tmp_path: Path):
+        # Force overflow by monkeypatching _PHASE_QUEUE_MAXSIZE to 1
+        # before __enter__. Workers will drop the vast majority of
+        # their phase records; the parent must surface one
+        # RuntimeWarning per worker with a non-zero drop count,
+        # rendered as a kind:"warning" row by SessionScope.
+        ref, deformed = self._smooth_pair()
+        kwargs = dict(window=24, overlap=0.5, search_radius=8, batch_size=64)
+
+        with pytest.MonkeyPatch.context() as mp_ctx:
+            from mamba_dvc.gpu import dispatch as dispatch_mod
+
+            mp_ctx.setattr(dispatch_mod, "_PHASE_QUEUE_MAXSIZE", 1)
+            with (
+                SessionScope(tmp_path, series="test"),
+                MultiGPUDispatcher(
+                    device_ids=[0, 0],
+                    anchored_reference=ref,
+                    emit_phase_records=True,
+                    **kwargs,
+                ) as d,
+            ):
+                d.correlate(None, deformed)
+
+        events = _read_events(tmp_path / "events.jsonl")
+        warnings_rows = [
+            e
+            for e in events
+            if e.get("kind") == "warning"
+            and "dropped" in str(e.get("message", ""))
+            and "phase records" in str(e.get("message", ""))
+        ]
+        assert warnings_rows, (
+            f'queue overflow did not surface as kind:"warning" on exit; '
+            f"events: {[e.get('kind') for e in events]}"
+        )

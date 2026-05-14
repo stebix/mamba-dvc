@@ -42,14 +42,20 @@ Multi-process note
 ------------------
 :mod:`mamba_dvc.gpu.dispatch` runs the per-batch NCC loop in ``spawn``ed
 worker processes for ``len(device_ids) > 1``. A worker does not inherit
-the parent's logging configuration, so the ``ncc.*`` and the
-``dispatch.h2d`` / ``dispatch.helper`` / ``dispatch.d2h`` records only
-surface on the single-process path (:func:`mamba_dvc.pipeline.correlate.correlate`,
-or ``correlate_multi_gpu(device_ids=[d])``). The coarse ``dispatch.*``
-phases that run on the parent (grid build, mask admission, the
-contiguous-array materialisation, the worker join, the outlier test) are
-always visible. For a detailed single-pair breakdown, run the
-single-device path.
+the parent's logging configuration by default, so the ``ncc.*`` and the
+``dispatch.h2d`` / ``dispatch.helper`` / ``dispatch.d2h`` records are
+dropped on multi-device runs unless the dispatcher was opened with
+``emit_phase_records=True`` (added in L3 of the event-logging
+buildout). With that flag set, each worker installs a non-blocking
+:class:`logging.handlers.QueueHandler` on its ``mamba_dvc.timing``
+logger and the records reach the parent's
+:class:`~mamba_dvc.run.eventlog.SessionScope` file handler tagged with
+``mdvc_device_id``. The coarse ``dispatch.*`` phases that run on the
+parent (grid build, mask admission, the contiguous-array
+materialisation, the worker join, the outlier test) are always visible.
+For a detailed single-pair breakdown without the bridge, run the
+single-device path (:func:`mamba_dvc.pipeline.correlate.correlate`, or
+``correlate_multi_gpu(device_ids=[d])``).
 
 Prefetch note
 -------------
