@@ -1,0 +1,74 @@
+# Batch displacement-field campaign — results_v3.
+#
+# Clean post-aliasing-fix re-run of the results_v2 surface. Knob-for-knob
+# identical to v2; only the campaign name (and therefore the output dir)
+# changes, so v2 stays in place for diff comparison.
+#
+# Context. Commit 87096ce fixed a MultiGPUDispatcher buffer-aliasing bug
+# in the persistent (with-block) path used by correlate_series — the
+# temporal-buildout work, not the single-pair batch driver here.
+# correlate_multi_gpu, which is what `mamba-dvc run` calls, was explicitly
+# NOT affected (see docs/triage/multi-gpu-aliasing-bug.md). v2's `ok`
+# numbers are already correct on the merits; v3 exists to produce a clean
+# artifact whose every cell post-dates the fix.
+#
+# Differences from results_v2:
+#   * campaign rename → out_dir is C:\...\dvc-result-storage\results_v3\
+#   * no resume from v2: a fresh campaign re-attempts the 3 cells that
+#     OOM'd in v2 (103L_Mg5Gd_4w_000 / fs204 / all three mt thresholds —
+#     MemoryError in zstd decode during load_pair).
+#   * fs004 is still included even though its MAE looked pathological in
+#     v2 (~17 vox @ mt0.9); fs004's GT magnitude is near-zero so absolute
+#     vox MAE is the wrong metric. Analysis should normalize by |GT| or
+#     report per-axis bias instead. Keep the cell, flag it downstream.
+#
+#     uv run mamba-dvc run configs/results_v3.yaml --dry-run     # preview
+#     uv run mamba-dvc run configs/results_v3.yaml               # execute
+#
+# Results land under C:\Users\jstebani\Desktop\dvc-result-storage\results_v3\;
+# re-running resumes (only missing variants are recomputed).
+# See docs/plans/run-interface.md.
+
+campaign: results_v3
+
+stores:
+  # All transduced stores, staged on the Desktop data dir.
+  - C:\Users\jstebani\Desktop\dvc-data-storage\103L_Mg5Gd_4w_000.zarr
+  - C:\Users\jstebani\Desktop\dvc-data-storage\5L_PEEK_4w_000.zarr
+  - C:\Users\jstebani\Desktop\dvc-data-storage\5R_Ti_4w_000.zarr
+
+manifest: null            # per-store discovery (sidecar YAML / embedded .zattrs)
+strict: false             # 5L_PEEK's synthetic/fs402/volume1 is truncated upstream
+                          # (see _corruption_report.json); strict:false opens the store
+                          # anyway and processes its 4 healthy synthetic entries + real.
+
+select:                   # which deformations to run per store
+  real: none              # real entries have no GT — skip them in this scoring campaign
+  synthetic: all          # fs004/fs104/fs204/fs304/fs402 where present (5L_PEEK has no fs402)
+
+defaults:                 # base correlation params; every variant starts here
+  window: 96
+  overlap: 0.8            # stride = round(96 * (1 - 0.8)) = 19 vox  → ~15x the v1 (0.5) grid
+  mask: mask_fill         # filled-screw mask (bone + screw region filled) — far less sparse
+                          # than the bare "mask"; gives real spatial coverage of the field.
+  mask_threshold: 0.9     # overridden by the sweep below
+  flow_convention: push_forward   # canonical transduced stores are authored push_forward —
+                                  # leaving this null would silently inflate synthetic error ~50x
+  batch_size: auto
+  ncc_mode: linear
+  ncc_normalization: overlap
+  search_radius: null     # null → window // 2
+  tukey_alpha: null       # null → the per-ncc-mode default
+  dry_shape: null         # null → full volume; [z, y, x] → centered subblock for smoke runs
+
+sweep:                    # cartesian product over named axes (each value → a variant)
+  mask_threshold: [0.9, 0.7, 0.5]   # same operating-point sweep as v2 for direct comparison
+
+variants: []              # explicit extra points merged onto `defaults`
+
+devices: [0, 1, 2, 3]     # all four GPUs
+distance_bins: []         # [] skips the (slow) boundary-distance EDT
+prefetch: 1               # overlap the next pair's zarr read with the current pair's correlate;
+                          # the prefetcher already gates on free host RAM so it won't stack two
+                          # pairs into an OOM. If 103L/fs204 OOMs again, retry with prefetch: 0.
+out_dir: C:\Users\jstebani\Desktop\dvc-result-storage   # campaign dir is <out_dir>\results_v3\
